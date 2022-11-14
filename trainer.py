@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 
 import numpy as np
 import time
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn.functional as F
@@ -118,7 +119,9 @@ class Trainer:
         fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
 
         train_filenames = readlines(fpath.format("train"))
+        train_filenames = [x.replace('/', '\\') for x in train_filenames]  # WINDOWS PATH ADJUSTMENT
         val_filenames = readlines(fpath.format("val"))
+        val_filenames = [x.replace('/', '\\') for x in val_filenames]  # WINDOWS PATH ADJUSTMENT
         img_ext = '.png' if self.opt.png else '.jpg'
 
         num_train_samples = len(train_filenames)
@@ -201,6 +204,10 @@ class Trainer:
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
+            # # print('inputs shape: {}'.format(list(inputs.values())[0].shape))
+            # for k, v in inputs.items():
+            #     print('key:', k, ', w/ shape:', v.shape)
+            # exit(0)
 
             outputs, losses = self.process_batch(inputs)
 
@@ -247,6 +254,11 @@ class Trainer:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
             features = self.models["encoder"](inputs["color_aug", 0, 0])
             outputs = self.models["depth"](features)
+            # for k, v in outputs.items():
+            #     print(k, v.shape)
+            #     plt.imshow(v[0].squeeze(0).squeeze(0).detach().cpu().numpy())
+            #     plt.show()
+            # assert False
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
@@ -287,6 +299,7 @@ class Trainer:
                         pose_inputs = torch.cat(pose_inputs, 1)
 
                     axisangle, translation = self.models["pose"](pose_inputs)
+                    # print('axisangle: {}\ntranslation: {}'.format(axisangle.shape, translation.shape))
                     outputs[("axisangle", 0, f_i)] = axisangle
                     outputs[("translation", 0, f_i)] = translation
 
@@ -344,14 +357,35 @@ class Trainer:
         """
         for scale in self.opt.scales:
             disp = outputs[("disp", scale)]
+            # plt.figure(0)
+            # plt.title('Disparity {} PRIMA del bilinear interp'.format(0))
+            # plt.imshow(disp[0].squeeze().cpu().detach().numpy())
             if self.opt.v1_multiscale:
                 source_scale = scale
             else:
                 disp = F.interpolate(
                     disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+                # plt.figure(1)
+                # plt.title('Disparity {} DOPO bilinear interp'.format(1))
+                # plt.imshow(disp[0].squeeze().cpu().detach().numpy())
+                # plt.show()
                 source_scale = 0
 
             _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
+            # print('chi sei disp?', disp[0].shape, 'max {}, min {}'.format(torch.max(disp[0]), torch.min(disp[0])))
+            # print('e la depth?', depth[0].shape, 'max {}, min {}'.format(torch.max(depth[0]), torch.min(depth[0])))
+            # plt.figure(0)
+            # plt.title('Depth w\\ min {}, max {}'
+            #           .format(round(torch.min(depth[0].squeeze()).cpu().detach().numpy().item(), 3),
+            #                   round(torch.max(depth[0].squeeze()).cpu().detach().numpy().item(), 3)))
+            # plt.imshow(depth[0].squeeze().cpu().detach().numpy())
+            # plt.figure(1)
+            # plt.title('Dispa w\\ min {}, max {}'
+            #           .format(round(torch.min(disp[0].squeeze()).cpu().detach().numpy().item(), 3),
+            #                   round(torch.max(disp[0].squeeze()).cpu().detach().numpy().item(), 3)))
+            # plt.imshow(disp[0].squeeze().cpu().detach().numpy())
+            # plt.show()
+            # assert False
 
             outputs[("depth", 0, scale)] = depth
 

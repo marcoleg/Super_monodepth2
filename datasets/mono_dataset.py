@@ -20,6 +20,15 @@ from torchvision import transforms
 def pil_loader(path):
     # open path as file to avoid ResourceWarning
     # (https://github.com/python-pillow/Pillow/issues/835)
+    path = 'D:\\File System D\\kitti_data\\' + path.split('kitti_data\\')[1]
+    path = path.replace('.jpg', '.png')
+    temp_path = path.split('kitti_data\\')[0] + 'kitti_data\\' + '0' + path.split('kitti_data\\')[1]
+    new_path = temp_path.split('image_0')[0] + 'image_0' + temp_path.split('image_0')[1][1:]
+    id_img = path.split('\\')[-1]
+    new_id = id_img[4:]
+    path = new_path.replace(id_img, new_id)
+    path = path.replace('\\data', '')
+
     with open(path, 'rb') as f:
         with Image.open(f) as img:
             return img.convert('RGB')
@@ -173,8 +182,9 @@ class MonoDataset(data.Dataset):
             inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
 
         if do_color_aug:
-            color_aug = transforms.ColorJitter.get_params(
-                self.brightness, self.contrast, self.saturation, self.hue)
+            color_aug = transforms.ColorJitter(self.brightness, self.contrast, self.saturation, self.hue)
+            # color_aug = transforms.ColorJitter.get_params(
+            #     self.brightness, self.contrast, self.saturation, self.hue)
         else:
             color_aug = (lambda x: x)
 
