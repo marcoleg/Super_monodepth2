@@ -26,6 +26,11 @@ class MonodepthOptions:
                                  help="log directory",
                                  default=os.path.join(os.path.expanduser("~"), "tmp"))
 
+        # self.parser.add_argument('--sp_weights_path',
+        #                          type=str,
+        #                          default=os.path.join(file_dir, "superpoint.pth"),
+        #                          help='Path to pretrained weights file (default: superpoint_v1.pth).')
+
         # TRAINING options
         self.parser.add_argument("--model_name",
                                  type=str,
@@ -150,7 +155,7 @@ class MonodepthOptions:
                                  nargs="+",
                                  type=str,
                                  help="models to load",
-                                 default=["encoder", "depth", "pose_encoder", "pose"])
+                                 default=["superpoint", "encoder", "depth", "pose_encoder", "pose"])
 
         # LOGGING options
         self.parser.add_argument("--log_frequency",
@@ -163,6 +168,10 @@ class MonodepthOptions:
                                  default=1)
 
         # EVALUATION options
+        self.parser.add_argument("--conf_thresh",
+                                 help="confidence threshold of superpoint",
+                                 type=float,
+                                 default=0.015)
         self.parser.add_argument("--eval_stereo",
                                  help="if set evaluates in stereo mode",
                                  action="store_true")

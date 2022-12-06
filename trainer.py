@@ -26,6 +26,8 @@ import datasets
 import networks
 from IPython import embed
 
+from torchvision.transforms.functional import rgb_to_grayscale
+
 
 class Trainer:
     def __init__(self, options):
@@ -51,6 +53,14 @@ class Trainer:
 
         if self.opt.use_stereo:
             self.opt.frame_ids.append("s")
+
+        self.models["superpoint"] = networks.SuperPointNet()
+        self.models["superpoint"].to(self.device)
+
+        # # Superpoint: Train on GPU, deploy on GPU.
+        # self.models["superpoint"].load_state_dict(torch.load(self.opt.sp_weights_path))
+        # self.models["superpoint"] = self.models["superpoint"].to(self.device)  # useless probably
+        self.parameters_to_train += list(self.models["superpoint"].parameters())
 
         self.models["encoder"] = networks.ResnetEncoder(
             self.opt.num_layers, self.opt.weights_init == "pretrained")
@@ -92,7 +102,7 @@ class Trainer:
             assert self.opt.disable_automasking, \
                 "When using predictive_mask, please disable automasking with --disable_automasking"
 
-            # Our implementation of the predictive masking baseline has the the same architecture
+            # Our implementation of the predictive masking baseline has the same architecture
             # as our depth decoder. We predict a separate mask for each source frame.
             self.models["predictive_mask"] = networks.DepthDecoder(
                 self.models["encoder"].num_ch_enc, self.opt.scales,
@@ -204,11 +214,14 @@ class Trainer:
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
-            # # print('inputs shape: {}'.format(list(inputs.values())[0].shape))
-            # for k, v in inputs.items():
-            #     print('key:', k, ', w/ shape:', v.shape)
-            # exit(0)
 
+            inputs = self.pre_process_batch(inputs)
+            if inputs[('color_aug_SP_out', 0, 0)][-1] is None:  # if heatmap is None -> there's no input color_aug image
+                img: torch.Tensor = rgb_to_grayscale(inputs['color_aug'])
+                inputs[('color_aug_SP_out', 0, 0)][-1] = torch.zeros((img.shape[0], img.shape[2], img.shape[3]))
+            for k, v in inputs.items():
+                print(k)
+            exit(0)
             outputs, losses = self.process_batch(inputs)
 
             self.model_optimizer.zero_grad()
@@ -231,6 +244,85 @@ class Trainer:
                 self.val()
 
             self.step += 1
+
+    def pre_process_batch(self, inputs):
+        """
+        Input: MD2 input which contains 'color_aug' image BxHxWx3 that is initially transformed in grayscale (BxHxW)
+        where B is the batch size.
+
+        Output (added in inputs dictionary and returned):
+        N: number of unrolled points (multiplied by B) after NMS, threshold, etc.
+        pts     --> 4xN     - 'survived' points (1st row: B; 2nd, 3rd row: H, W coords; 4th row: heatmap value)
+        desc    --> 256xN   - associated descripors (same order as pts)
+        heatmap --> BxHxW   - probability mask
+
+        N.B. there might be a problem with descriptors because the original method was not designed to work with B > 1
+        """
+        bord = 4
+        for key in inputs.keys():
+            # we take just the full size images, both the source one, the previous and the following
+            if key == ('color_aug', 0, 0) or key == ('color_aug', -1, 0) or key == ('color_aug', 1, 0):
+                idx = key[1]
+                img: torch.Tensor = rgb_to_grayscale(inputs[key])
+                batch_size, H, W = img.shape[0], img.shape[2], img.shape[3]
+                # print('input size: {}'.format(img.shape))
+                sp_enc_out = self.models["superpoint"](img.to(self.device))
+                # print("sp_out --> coarse kps: {}\t coarse desc: {}".format(sp_enc_out[0].shape, sp_enc_out[1].shape))
+                semi, coarse_desc = sp_enc_out[0], sp_enc_out[1]
+                dense = torch.exp(semi)
+                dense = dense / (torch.sum(dense, dim=1).unsqueeze(1) + 0.00001)  # Should sum to 1
+                nodust = dense[:, :-1, :, :]
+                Hc = int(H / 8)
+                Wc = int(W / 8)
+                nodust = torch.permute(nodust, (0, 2, 3, 1))
+                heatmap = torch.reshape(nodust, [batch_size, Hc, Wc, 8, 8])
+                heatmap = torch.permute(heatmap, [0, 1, 3, 2, 4])
+                heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
+                # print('heatmap final shape {}'.format(heatmap.shape))
+                # print("heatmap - max {}\tmin {}".format(heatmap.max(), heatmap.min()))
+                bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones([batch_size, heatmap.shape[1],
+                                                                                   heatmap.shape[2]]).to(self.device))
+                if len(xs) == 0:
+                    inputs[('color_aug_SP_out', idx, 0)] = [torch.zeros((4, 0)), None, None]
+                    return inputs
+                pts = torch.zeros((4, len(xs)))  # Populate point data sized 3xN.
+                pts[0, :] = bs
+                pts[1, :] = ys
+                pts[2, :] = xs
+                pts[3, :] = heatmap[bs, xs, ys]
+                # pts, _ = self.nms_fast(pts, H, W, dist_thresh=self.nms_dist) # NMS yes or not? if yes, implement it
+                inds = torch.argsort(pts[3, :], descending=True)
+                pts = pts[:, inds]  # Sort by confidence.
+                # Remove points along border.
+                toremoveB = torch.zeros((pts[0, :].shape[0],), dtype=torch.bool)
+                toremoveW = torch.logical_or(pts[1, :] < bord, pts[1, :] >= (W - bord))
+                toremoveH = torch.logical_or(pts[2, :] < bord, pts[2, :] >= (H - bord))
+                toremove = torch.logical_or(torch.logical_or(toremoveB, toremoveW), toremoveH).to(self.device)
+                pts = pts[:, ~toremove]
+                # print('pts final shape {}'.format(pts.shape))
+                # --- Process descriptor.
+                D = coarse_desc.shape[1]
+                if pts.shape[1] == 0:
+                    desc = np.zeros((batch_size, D, 0))
+                else:
+                    # Interpolate into descriptor map using 2D point locations.
+                    samp_pts = pts[1:3, :].clone()
+                    samp_pts[0, :] = (samp_pts[0, :] / (float(W) / 2.)) - 1.
+                    samp_pts[1, :] = (samp_pts[1, :] / (float(H) / 2.)) - 1.
+                    samp_pts = samp_pts.transpose(0, 1).contiguous()
+                    samp_pts = samp_pts.view(1, 1, -1, 2)
+                    samp_pts = samp_pts.float().to(self.device)
+                    # print('See torch.nn.functional.grid_sample:')
+                    # print('grid_sample --> input:', coarse_desc.view(1, 256, 24, -1).shape)
+                    # print('grid_sample --> grid:', samp_pts.shape)
+                    desc = torch.nn.functional.grid_sample(
+                        coarse_desc.view(1, 256, 24, -1), samp_pts, align_corners=True)
+                    desc = desc.reshape(D, -1)
+                    desc /= torch.norm(desc, dim=0)
+                    # print('desc final shape:', desc.shape)
+                inputs[('color_aug_SP_out', idx, 0)] = pts, desc, heatmap
+        # return torch.zeros((4, 0)), torch.zeros((256, 0)), None
+        return inputs
 
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
@@ -398,7 +490,6 @@ class Trainer:
 
                 # from the authors of https://arxiv.org/abs/1712.00175
                 if self.opt.pose_model_type == "posecnn":
-
                     axisangle = outputs[("axisangle", 0, frame_id)]
                     translation = outputs[("translation", 0, frame_id)]
 
@@ -513,7 +604,7 @@ class Trainer:
 
             if not self.opt.disable_automasking:
                 outputs["identity_selection/{}".format(scale)] = (
-                    idxs > identity_reprojection_loss.shape[1] - 1).float()
+                        idxs > identity_reprojection_loss.shape[1] - 1).float()
 
             loss += to_optimise.mean()
 
@@ -565,9 +656,9 @@ class Trainer:
         samples_per_sec = self.opt.batch_size / duration
         time_sofar = time.time() - self.start_time
         training_time_left = (
-            self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+                                     self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
         print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
-            " | loss: {:.5f} | time elapsed: {} | time left: {}"
+                       " | loss: {:.5f} | time elapsed: {} | time left: {}"
         print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
@@ -653,7 +744,6 @@ class Trainer:
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
             self.models[n].load_state_dict(model_dict)
-
         # loading adam state
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
         if os.path.isfile(optimizer_load_path):
