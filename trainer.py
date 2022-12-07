@@ -259,6 +259,7 @@ class Trainer:
         N.B. there might be a problem with descriptors because the original method was not designed to work with B > 1
         """
         bord = 4
+        dict_to_add = {}
         for key in inputs.keys():
             # we take just the full size images, both the source one, the previous and the following
             if key == ('color_aug', 0, 0) or key == ('color_aug', -1, 0) or key == ('color_aug', 1, 0):
@@ -283,8 +284,8 @@ class Trainer:
                 bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones([batch_size, heatmap.shape[1],
                                                                                    heatmap.shape[2]]).to(self.device))
                 if len(xs) == 0:
-                    inputs[('color_aug_SP_out', idx, 0)] = [torch.zeros((4, 0)), None, None]
-                    return inputs
+                    dict_to_add[('color_aug_SP_out', idx, 0)] = [torch.zeros((4, 0)), None, None]
+                    return {**inputs, **dict_to_add}
                 pts = torch.zeros((4, len(xs)))  # Populate point data sized 3xN.
                 pts[0, :] = bs
                 pts[1, :] = ys
@@ -320,9 +321,9 @@ class Trainer:
                     desc = desc.reshape(D, -1)
                     desc /= torch.norm(desc, dim=0)
                     # print('desc final shape:', desc.shape)
-                inputs[('color_aug_SP_out', idx, 0)] = pts, desc, heatmap
+                dict_to_add[('color_aug_SP_out', idx, 0)] = pts, desc, heatmap
         # return torch.zeros((4, 0)), torch.zeros((256, 0)), None
-        return inputs
+        return {**inputs, **dict_to_add}
 
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
