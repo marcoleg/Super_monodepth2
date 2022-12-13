@@ -24,7 +24,7 @@ class MonodepthOptions:
         self.parser.add_argument("--log_dir",
                                  type=str,
                                  help="log directory",
-                                 default=os.path.join(os.path.expanduser("~"), "tmp"))
+                                 default=os.path.join(file_dir, "tmp"))
 
         # self.parser.add_argument('--sp_weights_path',
         #                          type=str,
@@ -66,11 +66,15 @@ class MonodepthOptions:
                                  type=float,
                                  help="disparity smoothness weight",
                                  default=1e-3)
+        self.parser.add_argument("--SP_disparity_smoothness",
+                                 type=float,
+                                 help="SP disparity smoothness weight",
+                                 default=1e-4)
         self.parser.add_argument("--scales",
                                  nargs="+",
                                  type=int,
                                  help="scales used in the loss",
-                                 default=[0, 1, 2, 3])
+                                 default=[0])#, 1, 2, 3])
         self.parser.add_argument("--min_depth",
                                  type=float,
                                  help="minimum depth",
