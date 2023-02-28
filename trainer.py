@@ -31,8 +31,14 @@ from torchvision.transforms.functional import rgb_to_grayscale
 
 class Trainer:
     def __init__(self, options):
+        self.start_time = None
+        self.step = None
+        self.epoch = None
         self.opt = options
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
+
+        # Softmax
+        self.softmax = nn.Softmax(dim=1)
 
         # checking height and width are multiples of 32
         assert self.opt.height % 32 == 0, "'height' must be a multiple of 32"
@@ -57,23 +63,19 @@ class Trainer:
         self.models["superpoint"] = networks.SuperPointNet()
         self.models["superpoint"].to(self.device)
 
-        # # Superpoint: Train on GPU, deploy on GPU.
-        # self.models["superpoint"].load_state_dict(torch.load(self.opt.sp_weights_path))
-        # self.models["superpoint"] = self.models["superpoint"].to(self.device)  # useless probably
-        self.parameters_to_train += list(self.models["superpoint"].parameters())
+        # Superpoint: Train on GPU, deploy on GPU.
+        self.parameters_to_train += list(self.models["superpoint"].parameters())  # automatic weights loading
 
-        self.models["encoder"] = networks.ResnetEncoder(
-            self.opt.num_layers, self.opt.weights_init == "pretrained")
+        self.models["encoder"] = networks.ResnetEncoder(self.opt.num_layers, self.opt.weights_init == "pretrained")
         self.models["encoder"].to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
 
-        self.models["depth"] = networks.DepthDecoder(
-            self.models["encoder"].num_ch_enc, self.opt.scales)
+        self.models["depth"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc, self.opt.scales)
         self.models["depth"].to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
 
         if self.use_pose_net:
-            if self.opt.pose_model_type == "separate_resnet":
+            if self.opt.pose_model_type == "separate_resnet":  # pose_model_type = "separate_resnet" by default
                 self.models["pose_encoder"] = networks.ResnetEncoder(
                     self.opt.num_layers,
                     self.opt.weights_init == "pretrained",
@@ -155,7 +157,7 @@ class Trainer:
         for mode in ["train", "val"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
-        if not self.opt.no_ssim:
+        if not self.opt.no_ssim:  # opt.no_ssim is False --> not opt.no_ssim is True
             self.ssim = SSIM()
             self.ssim.to(self.device)
 
@@ -217,15 +219,24 @@ class Trainer:
 
             before_op_time = time.time()
 
-            # inputs = self.pre_process_batch(inputs)
-            # if inputs[('color_aug_SP_out', 0, 0)][-1] is None:  # if heatmap is None -> there's no input color_aug image
-            #     img: torch.Tensor = rgb_to_grayscale(inputs['color_aug'])
+            inputs = self.pre_process_batch(inputs)
+
+            if ('color_aug_SP_out', 0, 0) not in inputs:
+                img: torch.Tensor = rgb_to_grayscale(inputs[('color_aug', 0, 0)])
+                inputs[('color_aug_SP_out', 0, 0)] = (torch.zeros((4, 0), device=self.device),
+                                                      torch.zeros((256, 0), device=self.device),
+                                                      torch.zeros((img.shape[0], img.shape[2], img.shape[3]),
+                                                                  device=self.device))
+            # elif inputs[('color_aug_SP_out', 0, 0)][-1] is None:
+            #     # if heatmap is None -> there's no input color_aug img
+            #     img: torch.Tensor = rgb_to_grayscale(inputs[('color_aug', 0, 0)])
             #     inputs[('color_aug_SP_out', 0, 0)][-1] = torch.zeros((img.shape[0], img.shape[2], img.shape[3]))
 
             outputs, losses = self.process_batch(inputs)
 
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
+            # plot_grad_flow(self.models['superpoint'].named_parameters())  # is a statich method at the end of .py
             self.model_optimizer.step()
 
             duration = time.time() - before_op_time
@@ -257,21 +268,35 @@ class Trainer:
         heatmap --> BxHxW   - probability mask
 
         N.B. there might be a problem with descriptors because the original method was not designed to work with B > 1
+        TODO: non-maximum suppression still not implemented! Maybe we have to not implement it and also don't select
+        TODO: pixels with logical_OR or similar because we keep all the heatmap values so we must keep all descriptors!
         """
         bord = 4
         dict_to_add = {}
         for key in inputs.keys():
             # we take just the full size images, both the source one, the previous and the following
-            if key == ('color_aug', 0, 0) or key == ('color_aug', -1, 0) or key == ('color_aug', 1, 0):
+            # ONLY FORWARD TARGET IMAGE (idx: 0) AND NOT PREVIOUS (idx: -1) AND NEXT (idx: +1)!
+            if key == ('color_aug', 0, 0):  # or key == ('color_aug', -1, 0) or key == ('color_aug', 1, 0):
                 idx = key[1]
-                img: torch.Tensor = rgb_to_grayscale(inputs[key])
+                img = rgb_to_grayscale(inputs[key])
                 batch_size, H, W = img.shape[0], img.shape[2], img.shape[3]
                 # print('input size: {}'.format(img.shape))
+
+                print('+++++++++++++ pesi SP network:\n')
+                for name, param in self.models["superpoint"].named_parameters():
+                    if name == 'convPb.weight':
+                        print(param[0][:5].view(1, -1))
+
                 sp_enc_out = self.models["superpoint"](img.to(self.device))
                 # print("sp_out --> coarse kps: {}\t coarse desc: {}".format(sp_enc_out[0].shape, sp_enc_out[1].shape))
                 semi, coarse_desc = sp_enc_out[0], sp_enc_out[1]
-                dense = torch.exp(semi)
-                dense = dense / (torch.sum(dense, dim=1).unsqueeze(1) + 0.00001)  # Should sum to 1
+                if torch.isnan(torch.sum(semi)):
+                    print('SEMI, tot float(nan) - step 1:', torch.nonzero(torch.isnan(semi.view(-1))).shape)
+                # dense = torch.exp(semi)
+                # dense = dense / (torch.sum(dense, dim=1).unsqueeze(1) + 0.00001)  # Should sum to 1
+                dense = self.softmax(semi)  # Use torch Softmax instead of previous 2 lines
+                # if torch.isnan(torch.sum(dense)):  # Check weather the dense tensor has NaN values
+                #     print('HEATMAP, tot float(nan) - step 3:', torch.nonzero(torch.isnan(dense.view(-1))).shape)
                 nodust = dense[:, :-1, :, :]
                 Hc = int(H / 8)
                 Wc = int(W / 8)
@@ -281,26 +306,33 @@ class Trainer:
                 heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
                 # print('heatmap final shape {}'.format(heatmap.shape))
                 # print("heatmap - max {}\tmin {}".format(heatmap.max(), heatmap.min()))
-                bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones([batch_size, heatmap.shape[1],
-                                                                                       heatmap.shape[2]]).to(
-                    self.device))
+                # bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones([batch_size, heatmap.shape[1],
+                #                                                                        heatmap.shape[2]]).to(
+                #     self.device))  # OLD indexing considering threshold of SuperPoint
+                bs, xs, ys = torch.where(heatmap >=
+                                         torch.zeros([batch_size, heatmap.shape[1], heatmap.shape[2]]).to(self.device))
                 if len(xs) == 0:
-                    dict_to_add[('color_aug_SP_out', idx, 0)] = [torch.zeros((4, 0)), None, None]
+                    dict_to_add[('color_aug_SP_out', idx, 0)] = (torch.zeros((4, 0), device=self.device),
+                                                                 torch.zeros((256, 0), device=self.device),
+                                                                 torch.zeros((img.shape[0], img.shape[2], img.shape[3]),
+                                                                             device=self.device))
                     return {**inputs, **dict_to_add}
-                pts = torch.zeros((4, len(xs)))  # Populate point data sized 3xN.
+                pts = torch.zeros((4, len(xs)))  # Populate point data sized 3(or 4 if batch is considered)xN.
                 pts[0, :] = bs
                 pts[1, :] = ys
                 pts[2, :] = xs
                 pts[3, :] = heatmap[bs, xs, ys]
-                # pts, _ = self.nms_fast(pts, H, W, dist_thresh=self.nms_dist) # NMS yes or not? if yes, implement it
+                # pts, _ = self.nms_fast(pts, H, W, dist_thresh=self.nms_dist)  # See starting method comments!
                 inds = torch.argsort(pts[3, :], descending=True)
                 pts = pts[:, inds]  # Sort by confidence.
+
                 # Remove points along border.
-                toremoveB = torch.zeros((pts[0, :].shape[0],), dtype=torch.bool)
-                toremoveW = torch.logical_or(pts[1, :] < bord, pts[1, :] >= (W - bord))
-                toremoveH = torch.logical_or(pts[2, :] < bord, pts[2, :] >= (H - bord))
-                toremove = torch.logical_or(torch.logical_or(toremoveB, toremoveW), toremoveH).to(self.device)
-                pts = pts[:, ~toremove]
+                # toremoveB = torch.zeros((pts[0, :].shape[0],), dtype=torch.bool)
+                # toremoveW = torch.logical_or(pts[1, :] < bord, pts[1, :] >= (W - bord))
+                # toremoveH = torch.logical_or(pts[2, :] < bord, pts[2, :] >= (H - bord))
+                # toremove = torch.logical_or(torch.logical_or(toremoveB, toremoveW), toremoveH).to(self.device)
+                # pts = pts[:, ~toremove]
+
                 # print('pts final shape {}'.format(pts.shape))
                 # --- Process descriptor.
                 D = coarse_desc.shape[1]
@@ -314,17 +346,14 @@ class Trainer:
                     samp_pts = samp_pts.transpose(0, 1).contiguous()
                     samp_pts = samp_pts.view(1, 1, -1, 2)
                     samp_pts = samp_pts.float().to(self.device)
-                    # print('See torch.nn.functional.grid_sample:')
                     # print('grid_sample --> input:', coarse_desc.view(1, 256, 24, -1).shape)
                     # print('grid_sample --> grid:', samp_pts.shape)
                     desc = torch.nn.functional.grid_sample(
-                        coarse_desc.view(1, 256, 24, -1), samp_pts, align_corners=True)
+                        coarse_desc.view(1, 256, 24, -1).cpu(), samp_pts.cpu(), align_corners=True)
                     desc = desc.reshape(D, -1)
-                    desc /= torch.norm(desc, dim=0)
+                    desc = desc / torch.norm(desc, dim=0)
                     # print('desc final shape:', desc.shape)
-                dict_to_add[('color_aug_SP_out', idx, 0)] = pts, desc, heatmap
-        # return torch.zeros((4, 0)), torch.zeros((256, 0)), None
-        torch.cuda.empty_cache()
+                dict_to_add[('color_aug_SP_out', idx, 0)] = (pts, desc, heatmap)
         return {**inputs, **dict_to_add}
 
     def process_batch(self, inputs):
@@ -334,7 +363,7 @@ class Trainer:
             if isinstance(ipt, tuple): continue  # SuperPoint outs are in a tuple and already in cuda
             inputs[key] = ipt.to(self.device)
 
-        if self.opt.pose_model_type == "shared":
+        if self.opt.pose_model_type == "shared":  # pose_model_type != "shared" by default
             # If we are using a shared encoder for both depth and pose (as advocated
             # in monodepthv1), then all images are fed separately through the depth encoder.
             all_color_aug = torch.cat([inputs[("color_aug", i, 0)] for i in self.opt.frame_ids])
@@ -350,20 +379,17 @@ class Trainer:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
             features = self.models["encoder"](inputs["color_aug", 0, 0])
             outputs = self.models["depth"](features)
-            # for k, v in outputs.items():
-            #     print(k, v.shape)
-            #     plt.imshow(v[0].squeeze(0).squeeze(0).detach().cpu().numpy())
-            #     plt.show()
-            # assert False
 
-        if self.opt.predictive_mask:
+        if self.opt.predictive_mask:  # opt.predictive_mask is False by default
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
 
-        if self.use_pose_net:
-            outputs.update(self.predict_poses(inputs, features))
+        if self.use_pose_net:  # use_pose_net is True by default
+            outputs.update(self.predict_poses(inputs, features))  # cam_T_cam is added and poses too to output dict
 
         self.generate_images_pred(inputs, outputs)
         losses = self.compute_losses(inputs, outputs)  # 3 losses (img scale dependent) + total loss
+
+        print(losses)
 
         return outputs, losses
 
@@ -371,35 +397,35 @@ class Trainer:
         """Predict poses between input frames for monocular sequences.
         """
         outputs = {}
-        if self.num_pose_frames == 2:
+        if self.num_pose_frames == 2:  # num_pose_frames = 2 by default
             # In this setting, we compute the pose to each source frame via a
             # separate forward pass through the pose network.
 
             # select what features the pose network takes as input
-            if self.opt.pose_model_type == "shared":
+            if self.opt.pose_model_type == "shared":  # pose_model_type = 'separate_resnet' by default
                 pose_feats = {f_i: features[f_i] for f_i in self.opt.frame_ids}
             else:
-                pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.opt.frame_ids}
+                pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.opt.frame_ids}  # keys: [0, -1, +1]
 
             for f_i in self.opt.frame_ids[1:]:
                 if f_i != "s":
                     # To maintain ordering we always pass frames in temporal order
                     if f_i < 0:
-                        pose_inputs = [pose_feats[f_i], pose_feats[0]]
+                        pose_inputs = [pose_feats[f_i], pose_feats[0]]  # is the order of T (from -1 to 0)
                     else:
-                        pose_inputs = [pose_feats[0], pose_feats[f_i]]
+                        pose_inputs = [pose_feats[0], pose_feats[f_i]]  # viceversa (0 to +1)
 
-                    if self.opt.pose_model_type == "separate_resnet":
-                        pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
+                    if self.opt.pose_model_type == "separate_resnet":  # pose_encoder returns the pose encoded
+                        pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]  # cat pose_feats
                     elif self.opt.pose_model_type == "posecnn":
                         pose_inputs = torch.cat(pose_inputs, 1)
 
                     axisangle, translation = self.models["pose"](pose_inputs)
                     # print('axisangle: {}\ntranslation: {}'.format(axisangle.shape, translation.shape))
-                    outputs[("axisangle", 0, f_i)] = axisangle
-                    outputs[("translation", 0, f_i)] = translation
+                    outputs[("axisangle", 0, f_i)] = axisangle  # B, 2, 1, 3 --> there are 2 poses, but we need 1
+                    outputs[("translation", 0, f_i)] = translation  # B, 2, 1, 3 --> there are 2 poses, but we need 1
 
-                    # Invert the matrix if the frame id is negative
+                    # Invert the matrix if the frame id is negative (taking [:, 0] means the first pose)
                     outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
                         axisangle[:, 0], translation[:, 0], invert=(f_i < 0))
 
@@ -437,6 +463,17 @@ class Trainer:
             inputs = self.val_iter.next()
 
         with torch.no_grad():
+            inputs = self.pre_process_batch(inputs)
+
+            if ('color_aug_SP_out', 0, 0) not in inputs:
+                img: torch.Tensor = rgb_to_grayscale(inputs[('color_aug', 0, 0)])
+                inputs[('color_aug_SP_out', 0, 0)] = (torch.zeros((4, 0)),
+                                                      torch.zeros((256, 0)),
+                                                      torch.zeros((img.shape[0], img.shape[2], img.shape[3])))
+            elif inputs[('color_aug_SP_out', 0, 0)][-1] is None:  # if heatmap is None -> there's no input color_aug img
+                img: torch.Tensor = rgb_to_grayscale(inputs['color_aug'])
+                inputs[('color_aug_SP_out', 0, 0)][-1] = torch.zeros((img.shape[0], img.shape[2], img.shape[3]))
+
             outputs, losses = self.process_batch(inputs)
 
             if "depth_gt" in inputs:
@@ -453,47 +490,26 @@ class Trainer:
         """
         for scale in self.opt.scales:
             disp = outputs[("disp", scale)]
-            # plt.figure(0)
-            # plt.title('Disparity {} PRIMA del bilinear interp'.format(0))
-            # plt.imshow(disp[0].squeeze().cpu().detach().numpy())
-            if self.opt.v1_multiscale:
+            if self.opt.v1_multiscale:  # v1_multiscale is False by default
                 source_scale = scale
             else:
                 disp = F.interpolate(
                     disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
-                # plt.figure(1)
-                # plt.title('Disparity {} DOPO bilinear interp'.format(1))
-                # plt.imshow(disp[0].squeeze().cpu().detach().numpy())
-                # plt.show()
                 source_scale = 0
 
             _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
-            # print('chi sei disp?', disp[0].shape, 'max {}, min {}'.format(torch.max(disp[0]), torch.min(disp[0])))
-            # print('e la depth?', depth[0].shape, 'max {}, min {}'.format(torch.max(depth[0]), torch.min(depth[0])))
-            # plt.figure(0)
-            # plt.title('Depth w\\ min {}, max {}'
-            #           .format(round(torch.min(depth[0].squeeze()).cpu().detach().numpy().item(), 3),
-            #                   round(torch.max(depth[0].squeeze()).cpu().detach().numpy().item(), 3)))
-            # plt.imshow(depth[0].squeeze().cpu().detach().numpy())
-            # plt.figure(1)
-            # plt.title('Dispa w\\ min {}, max {}'
-            #           .format(round(torch.min(disp[0].squeeze()).cpu().detach().numpy().item(), 3),
-            #                   round(torch.max(disp[0].squeeze()).cpu().detach().numpy().item(), 3)))
-            # plt.imshow(disp[0].squeeze().cpu().detach().numpy())
-            # plt.show()
-            # assert False
 
             outputs[("depth", 0, scale)] = depth
 
             for i, frame_id in enumerate(self.opt.frame_ids[1:]):
 
-                if frame_id == "s":
+                if frame_id == "s":  # frame_id != "s" by default --> else branch
                     T = inputs["stereo_T"]
                 else:
                     T = outputs[("cam_T_cam", 0, frame_id)]
 
                 # from the authors of https://arxiv.org/abs/1712.00175
-                if self.opt.pose_model_type == "posecnn":
+                if self.opt.pose_model_type == "posecnn":  # pose_model_type == "separete_cnn" by default
                     axisangle = outputs[("axisangle", 0, frame_id)]
                     translation = outputs[("translation", 0, frame_id)]
 
@@ -505,17 +521,28 @@ class Trainer:
 
                 cam_points = self.backproject_depth[source_scale](
                     depth, inputs[("inv_K", source_scale)])
-                pix_coords = self.project_3d[source_scale](
-                    cam_points, inputs[("K", source_scale)], T)
+                pix_coords = self.project_3d[source_scale](cam_points, inputs[("K", source_scale)], T)
 
                 outputs[("sample", frame_id, scale)] = pix_coords
 
                 outputs[("color", frame_id, scale)] = F.grid_sample(
                     inputs[("color", frame_id, source_scale)],
                     outputs[("sample", frame_id, scale)],
-                    padding_mode="border")
+                    padding_mode="border")  # this is the reprojected sampled image color
 
-                if not self.opt.disable_automasking:
+                # plt.figure(0)
+                # plt.title(("reprojected", frame_id, scale))
+                # plt.imshow(outputs[("color", frame_id, scale)][0].permute(1, 2, 0).detach().cpu())
+                # plt.figure(1)
+                # plt.title(("target (0)", 0, scale))
+                # plt.imshow(inputs[("color_aug", 0, 0)][0].permute(1, 2, 0).detach().cpu())
+                # plt.figure(2)
+                # plt.title(("source (-1)", 0, scale))
+                # plt.imshow(inputs[("color_aug", -1, 0)][0].permute(1, 2, 0).detach().cpu())
+                # plt.show()
+                # exit(0)
+
+                if not self.opt.disable_automasking:  # opt.disable_automasking is False by default -> not (...) is True
                     outputs[("color_identity", frame_id, scale)] = \
                         inputs[("color", frame_id, source_scale)]
 
@@ -525,7 +552,7 @@ class Trainer:
         abs_diff = torch.abs(target - pred)
         l1_loss = abs_diff.mean(1, True)
 
-        if self.opt.no_ssim:
+        if self.opt.no_ssim:  # opt.no_ssim is False --> else branch
             reprojection_loss = l1_loss
         else:
             ssim_loss = self.ssim(pred, target).mean(1, True)
@@ -533,18 +560,43 @@ class Trainer:
 
         return reprojection_loss
 
+    def compute_reprojection_loss_w_heatmap(self, pred, target, heatmap):
+        """Computes reprojection loss between a batch of predicted and target images
+        """
+        abs_diff = torch.abs(target - pred)
+        l1_loss = abs_diff.mean(1, True)
+        # l1_loss_times_heat = l1_loss * heatmap.unsqueeze(1)
+
+        if self.opt.no_ssim:  # opt.no_ssim is False --> else branch
+            reprojection_loss = l1_loss
+        else:
+            ssim_loss = self.ssim(pred, target).mean(1, True)
+            # ssim_loss_times_heat = ssim_loss * heatmap.unsqueeze(1)
+            # why is not (1-SSIM())?? why is not 0.85/2 like in formule above equation 3 in the paper?
+            # --> maybe the answer is in the SSIM() method!
+            reprojection_loss = heatmap.unsqueeze(1) * (0.85 * ssim_loss + 0.15 * l1_loss)
+
+        return reprojection_loss
+
+    @staticmethod
+    def compute_regularization_SP_loss(heatmap):
+        diff = torch.ones_like(heatmap, requires_grad=True) - heatmap
+        sum_reg = torch.sum(diff)
+        return sum_reg
+
     def compute_losses(self, inputs, outputs):
         """Compute the reprojection and smoothness losses for a minibatch
         """
-        global idxs, identity_reprojection_loss
+        global idxs, idxs_SP, identity_reprojection_loss, identity_reprojection_loss_SP
         losses = {}
         total_loss = 0
 
         for scale in self.opt.scales:
-            loss = 0
+            loss, loss_SP = 0, 0
             reprojection_losses = []  # indicated by L_p in the MD2 paper
+            reprojection_losses_SP = []  # SP loss term
 
-            if self.opt.v1_multiscale:
+            if self.opt.v1_multiscale:  # opt.v1_multiscale False by default --> else branch
                 source_scale = scale
             else:
                 source_scale = 0
@@ -553,8 +605,21 @@ class Trainer:
             color = inputs[("color", 0, scale)]
             target = inputs[("color", 0, source_scale)]
 
-            for frame_id in self.opt.frame_ids[1:]:
+            for frame_id in self.opt.frame_ids[1:]:  # -1 and 1 --> prev and next image
                 pred = outputs[("color", frame_id, scale)]
+
+                # plt.figure(0)
+                # plt.title(("reprojected", frame_id, scale))
+                # plt.imshow(outputs[("color", frame_id, scale)][0].permute(1, 2, 0).detach().cpu())
+                # plt.figure(1)
+                # plt.title(("target (0)", 0, scale))
+                # plt.imshow(inputs[("color_aug", 0, 0)][0].permute(1, 2, 0).detach().cpu())
+                # plt.figure(2)
+                # plt.title(("source (-1)", 0, scale))
+                # plt.imshow(inputs[("color_aug", -1, 0)][0].permute(1, 2, 0).detach().cpu())
+                # plt.show()
+                # exit(0)
+
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
 
             reprojection_losses = torch.cat(reprojection_losses, 1)
@@ -591,7 +656,7 @@ class Trainer:
             else:
                 reprojection_loss = reprojection_losses
 
-            if not self.opt.disable_automasking:
+            if not self.opt.disable_automasking:  # False by default -> not disable_automasking is True
                 # add random numbers to break ties
                 identity_reprojection_loss += torch.randn(
                     identity_reprojection_loss.shape, device=self.device) * 0.00001
@@ -600,12 +665,12 @@ class Trainer:
             else:
                 combined = reprojection_loss
 
-            if combined.shape[1] == 1:
+            if combined.shape[1] == 1:  # combined.shape[1] != 1
                 to_optimise = combined
             else:
-                to_optimise, idxs = torch.min(combined, dim=1)
+                to_optimise, idxs = torch.min(combined, dim=1)  # min among identity_repr_loss and reprojected_loss
 
-            if not self.opt.disable_automasking:
+            if not self.opt.disable_automasking:  # False by default -> not disable_automasking is True
                 outputs["identity_selection/{}".format(scale)] = (
                         idxs > identity_reprojection_loss.shape[1] - 1).float()
 
@@ -615,27 +680,147 @@ class Trainer:
             norm_disp = disp / (mean_disp + 1e-7)
             smooth_loss = get_smooth_loss(norm_disp, color)  # indicated by L_s in the MD2 paper
 
-            loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
+            loss = loss + self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
             total_loss += loss
             losses["loss/{}".format(scale)] = loss
 
-            # if scale != 0: continue
-            # # Grab SP probs to mask input image and disparity too. L_s computed just for img_0 as MD2 standard pipeline
-            # heatmap: torch.Tensor = inputs[('color_aug', 0, scale)]
-            # B, C, H, W = heatmap.shape
-            # heat_bool = torch.where(heatmap > self.opt.conf_thresh * torch.ones([B, C, H, W]).to(self.device))
-            # mask_sp = torch.zeros(heatmap.shape).to(self.device)
+            ########################################################################################
+            ############## LOSS SUPERPOINT SECTION - REPROJECTION AND REGULARIZAZION ###############
+            ########################################################################################
+            if scale != 0: continue  # FOR SP LOSS TERM WE IGNORE SCALE != 0
+            # TODO: different scales for heatmap (?)
+            heatmap = inputs[('color_aug_SP_out', 0, scale)][2]  # heatmap of target image (indexed by 0)
+
+            loss_SP_reg = self.compute_regularization_SP_loss(heatmap)
+            # loss_SP += self.opt.SP_regulariz_loss_decay * loss_SP_reg
+            losses["loss_SP_reg/{}".format(scale)] = loss_SP_reg
+
+            for frame_id in self.opt.frame_ids[1:]:  # -1 and 1 --> prev and next image
+                pred = outputs[("color", frame_id, scale)]
+                reprojection_losses_SP.append(self.compute_reprojection_loss_w_heatmap(pred, target, heatmap))
+
+            reprojection_losses_SP = torch.cat(reprojection_losses_SP, 1)
+
+            if not self.opt.disable_automasking:  # False by default -> not disable_automasking is True
+                identity_reprojection_losses_SP = []
+                # N.B. identity is the reprojection with target image -> we compare taget, +1, -1, and we choose the one
+                # with reprojection error which is the minimum
+                for frame_id in self.opt.frame_ids[1:]:
+                    pred = inputs[("color", frame_id, source_scale)]
+                    identity_reprojection_losses_SP.append(
+                        self.compute_reprojection_loss_w_heatmap(pred, target, heatmap))
+
+                identity_reprojection_losses_SP = torch.cat(identity_reprojection_losses_SP, 1)
+
+                if self.opt.avg_reprojection:  # False by default -> else branch
+                    identity_reprojection_loss_SP = identity_reprojection_losses_SP.mean(1, keepdim=True)
+                else:
+                    # save both images, and do min all at once below
+                    identity_reprojection_loss_SP = identity_reprojection_losses_SP
+
+            elif self.opt.predictive_mask:  # False by default
+                # use the predicted mask
+                mask = outputs["predictive_mask"]["disp", scale]
+                if not self.opt.v1_multiscale:
+                    mask = F.interpolate(mask, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+
+                reprojection_losses *= mask
+
+                # add a loss pushing mask to 1 (using nn.BCELoss for stability)
+                weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cuda())
+                loss += weighting_loss.mean()
+
+            if self.opt.avg_reprojection:  # False by default -> else branch
+                reprojection_loss_SP = reprojection_losses.mean(1, keepdim=True)
+            else:
+                reprojection_loss_SP = reprojection_losses_SP
+
+            if not self.opt.disable_automasking:  # False by default -> not disable_automasking is True
+                # add random numbers to break ties (NB: it was randn, now is rand to avoid loss < 0)
+                identity_reprojection_loss_SP += torch.rand(
+                    identity_reprojection_loss_SP.shape, device=self.device) * 0.00001
+
+                combined_SP = torch.cat((identity_reprojection_loss_SP, reprojection_loss_SP), dim=1)
+            else:
+                combined_SP = reprojection_loss_SP
+
+            if combined_SP.shape[1] == 1:  # combined_SP.shape[1] != 1
+                to_optimise_SP = combined_SP
+            else:
+                # min among identity_repr_loss_SP and reprojected_loss_SP
+                to_optimise_SP, idxs_SP = torch.min(combined_SP, dim=1)
+
+            if not self.opt.disable_automasking:  # False by default -> not disable_automasking is True
+                outputs["identity_selection/{}".format(scale)] = (
+                        idxs_SP > identity_reprojection_loss_SP.shape[1] - 1).float()
+
+            loss_SP += to_optimise_SP.mean()
+            # total_loss += loss_SP
+            total_loss += self.opt.SP_regulariz_loss_decay * loss_SP_reg
+            # TODO: prova reinizializzando i pesi di SP!
+            losses["loss_SP/{}".format(scale)] = loss_SP
+
+            '''
+            # DELETE THIS PART WITH PARSIMONIA!!!!
+
+            # Grab SP probs to mask input image and disparity too. L_s computed just for img_0 as MD2 standard pipeline
+            heatmap = inputs[('color_aug_SP_out', 0, scale)][-1]
+            # heatmap.retain_grad()  # remove
+            # l = torch.norm(heatmap)
+            # l.backward()
+            # print('706 - ORA DOVREBBE AVERE IL GRADIENTE:', heatmap.grad.shape)
+            # exit(0)
+
+            # temp = torch.ones(heatmap.shape).to(self.device)  # remove
+            # loss_SP = torch.norm(temp-heatmap)  # remove
+
+            # print('loss_SP:', loss_SP)
+            # print('loss_SP shape:', loss_SP.shape)
+            # print('1:', heatmap.grad)
+            # self.model_optimizer.zero_grad()
+            # print(losses)
+            # loss_SP.backward()
+            # # plot_grad_flow(self.models['superpoint'].named_parameters())
+            # self.model_optimizer.step()
+            # print('2:', heatmap.grad)
+            # exit(0)
+            B, H, W = heatmap.shape
+            # heat_bool = torch.where(heatmap.unsqueeze(1) > self.opt.conf_thresh * torch.ones([B, 1, H, W]).to(self.device))
+            # heat_bool.retain_grad()  # remove
+            # print('heat bool shape:', heat_bool.shape)
+            # mask_sp = torch.zeros(heatmap.unsqueeze(1).shape, requires_grad=True).to(self.device)
             # mask_sp[heat_bool] = 1.0
+            # mask_sp.retain_grad()  # remove
             # masked_img = mask_sp * color
             # masked_disp = mask_sp * disp
-            # smooth_loss_SP = get_smooth_loss(masked_disp, masked_img)
-            # loss += self.opt.SP_disparity_smoothness * smooth_loss_SP / (2 ** scale)
-            # total_loss += loss
-            # losses["loss_SP/{}".format(scale)] = loss
+
+            # masked_img = heatmap.unsqueeze(1).repeat(1, 3, 1, 1) * color
+            # masked_disp = heatmap.unsqueeze(1) * disp
+
+            masked_img = heatmap.unsqueeze(1).repeat(1, 3, 1, 1) * color
+            masked_disp = heatmap.unsqueeze(1) * disp
+
+            # masked_img.reatain_grad()  # remove (SURE??????)
+            # masked_disp.retain_grad()  # remove
+            # print(masked_img)
+            # exit(0)
+            # masked_disp.retain_grad()
+            smooth_loss_SP = get_smooth_loss(masked_disp, masked_img)
+            # smooth_loss_SP.retain_grad()  # remove
+            # loss += (self.opt.SP_disparity_smoothness * smooth_loss_SP / (2 ** scale))  # old formula
+            loss_SP = loss_SP + (self.opt.SP_disparity_smoothness * smooth_loss_SP)
+
+            # loss_SP.retain_grad()
+            # print('requires_grad SP:', loss_SP.requires_grad, '\tgrad:', loss_SP.grad)
+            # print('leaf SP:', loss_SP.is_leaf)
+            total_loss = total_loss + loss_SP
+            # print("autograd grad SP:", torch.autograd.grad(total_loss, masked_img, retain_graph=True)[0][0][0][0][0])
+            losses["loss_SP/{}".format(scale)] = loss_SP
+            '''
 
         # total_loss is not properly correct because it's scaled by 4 (num_scales) while SP_loss is computed just with
         # one single scale level. This global scale could be interpretated as an additional scaling of the SP_loss
-        total_loss /= self.num_scales
+        total_loss = total_loss / self.num_scales
         losses["loss"] = total_loss
         return losses
 
@@ -703,14 +888,14 @@ class Trainer:
                     "disp_{}/{}".format(s, j),
                     normalize_image(outputs[("disp", s)][j]), self.step)
 
-                if self.opt.predictive_mask:
+                if self.opt.predictive_mask:  # False by default
                     for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
                         writer.add_image(
                             "predictive_mask_{}_{}/{}".format(frame_id, s, j),
                             outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
                             self.step)
 
-                elif not self.opt.disable_automasking:
+                elif not self.opt.disable_automasking:  # False by default -> not disable_automasking is True
                     writer.add_image(
                         "automask_{}/{}".format(s, j),
                         outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
@@ -745,6 +930,7 @@ class Trainer:
 
         save_path = os.path.join(save_folder, "{}.pth".format("adam"))
         torch.save(self.model_optimizer.state_dict(), save_path)
+        print('Save model in:', save_path)
 
     def load_model(self):
         """Load model(s) from disk
@@ -763,6 +949,7 @@ class Trainer:
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
             self.models[n].load_state_dict(model_dict)
+
         # loading adam state
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
         if os.path.isfile(optimizer_load_path):
@@ -771,3 +958,23 @@ class Trainer:
             self.model_optimizer.load_state_dict(optimizer_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
+
+    @staticmethod
+    def plot_grad_flow(named_parameters):
+        ave_grads = []
+        layers = []
+        for n, p in named_parameters:
+            print("name:", n)
+            if p.requires_grad and "bias" not in n:
+                layers.append(n)
+                print('param grad:', p.grad)
+                ave_grads.append(p.grad.abs().mean().cpu())
+        plt.plot(ave_grads, alpha=0.3, color="b")
+        plt.hlines(0, 0, len(ave_grads) + 1, linewidth=1, color="k")
+        plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
+        plt.xlim(xmin=0, xmax=len(ave_grads))
+        plt.xlabel("Layers")
+        plt.ylabel("average gradient")
+        plt.title("Gradient flow")
+        plt.grid(True)
+        plt.pause(1)

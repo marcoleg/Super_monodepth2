@@ -66,10 +66,10 @@ class MonodepthOptions:
                                  type=float,
                                  help="disparity smoothness weight",
                                  default=1e-3)
-        self.parser.add_argument("--SP_disparity_smoothness",
+        self.parser.add_argument("--SP_regulariz_loss_decay",
                                  type=float,
-                                 help="SP disparity smoothness weight",
-                                 default=1e-4)
+                                 help="SP regularization loss decay weight",
+                                 default=1e-3)
         self.parser.add_argument("--scales",
                                  nargs="+",
                                  type=int,
