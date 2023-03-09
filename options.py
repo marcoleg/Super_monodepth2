@@ -70,6 +70,14 @@ class MonodepthOptions:
                                  type=float,
                                  help="SP regularization loss decay weight",
                                  default=1e-3)
+        self.parser.add_argument("--SP_loss_sparsity_weight",
+                                 type=float,
+                                 help="SP loss weight for sparsity",
+                                 default=1e-1)
+        self.parser.add_argument("--SP_loss_gamma",
+                                 type=float,
+                                 help="SP loss gamma which multiplies reprojection loss",
+                                 default=1)
         self.parser.add_argument("--scales",
                                  nargs="+",
                                  type=int,
@@ -175,7 +183,7 @@ class MonodepthOptions:
         self.parser.add_argument("--conf_thresh",
                                  help="confidence threshold of superpoint",
                                  type=float,
-                                 default=0.015)
+                                 default=0.75)
         self.parser.add_argument("--eval_stereo",
                                  help="if set evaluates in stereo mode",
                                  action="store_true")

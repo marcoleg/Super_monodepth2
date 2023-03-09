@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.optim as optim
+from torch import nn
 from torchvision.transforms.functional import rgb_to_grayscale
 
 
@@ -75,7 +76,7 @@ class Net(torch.nn.Module):
 class Options:
     def __init__(self):
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-        self.learning_rate = 1e-4
+        self.learning_rate = 1e-1
         self.scheduler_step_size = 15
         self.load_weights_folder = os.path.expanduser('.\\tmp\\mono_model\\models\\weights_19_copia_originale\\')
         self.epochs = 3
@@ -113,6 +114,12 @@ def get_smooth_loss(disp, img):
     return grad_disp_x.mean() + grad_disp_y.mean()
 
 
+def compute_regularization_SP_loss(heatmap):
+    diff = torch.ones_like(heatmap, requires_grad=True) - heatmap
+    sum_reg = torch.sum(diff)
+    return sum_reg
+
+
 def main():
     model = SuperPointNet()
     # model = Net()
@@ -120,7 +127,7 @@ def main():
     parameters_to_train = list(model.parameters())
     model_optimizer = optim.Adam(parameters_to_train, opt.learning_rate)
     model_lr_scheduler = optim.lr_scheduler.StepLR(model_optimizer, opt.scheduler_step_size, 0.1)
-    load_model(model=model)
+    # load_model(model=model)
 
     for name, param in model.named_parameters():
         # print(name)
@@ -133,19 +140,27 @@ def main():
 
     model.train()
     for t in range(200):
-        loss_SP, total_loss = 0, 0
+        loss_SP_reg, total_loss = 0, 0
 
         model_lr_scheduler.step()
-        img = rgb_to_grayscale(torch.randn(8, 3, 192, 640).to(opt.device))
+        b = 1
+        print('BATCH: {}'.format(b))
+        img = rgb_to_grayscale(torch.randn(b, 3, 192, 640).to(opt.device))
         batch_size, H, W = img.shape[0], img.shape[2], img.shape[3]
         # img = torch.randn(8, 1, 192, 640).to(opt.device)  # for Net()
         semi, coarse_desc = model(img)
+        # print(semi[0, :, 12, 35])
+        # print('max semi:\n', torch.max(semi[0, :, 12, 35], dim=0))
         # semi = model(img.squeeze(1).flatten())  # for Net()
 
-        dense = torch.exp(semi)
-        dense = dense / (torch.sum(dense, dim=1).unsqueeze(1) + 0.00001)  # Should sum to 1
+        # dense = torch.exp(semi)
+        # dense = dense / (torch.sum(dense, dim=1).unsqueeze(1) + 0.00001)  # Should sum to 1
+        dense = nn.Softmax(dim=1)(semi)  # Use torch Softmax instead of previous 2 lines
         # dense.retain_grad()  # remove
         nodust = dense[:, :-1, :, :]
+        # print(nodust[0, :, 12, 35])
+        # print('max nodust:\n', torch.max(nodust[0, :, 12, 35], dim=0))
+        # exit(0)
         Hc = int(H / 8)
         Wc = int(W / 8)
         nodust = torch.permute(nodust, (0, 2, 3, 1))
@@ -153,63 +168,54 @@ def main():
         heatmap = torch.reshape(nodust, [batch_size, Hc, Wc, 8, 8])
         heatmap = torch.permute(heatmap, [0, 1, 3, 2, 4])
         heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
-        bs, xs, ys = torch.where(heatmap >= 0.01 * torch.ones([batch_size, heatmap.shape[1],
-                                                               heatmap.shape[2]]).to(opt.device))
-        pts = torch.zeros((4, len(xs)))  # Populate point data sized 3xN.
-        pts[0, :] = bs
-        pts[1, :] = ys
-        pts[2, :] = xs
-        pts[3, :] = heatmap[bs, xs, ys]
-        # pts, _ = self.nms_fast(pts, H, W, dist_thresh=self.nms_dist) # NMS yes or not? if yes, implement it
-        inds = torch.argsort(pts[3, :], descending=True)
-        pts = pts[:, inds]  # Sort by confidence.
+        torch.set_printoptions(threshold=192*640)
+        # print('max heatmap:\n', torch.max(heatmap[0], dim=0)[0].view(-1, 8))
 
-        # Remove points along border.
-        # toremoveB = torch.zeros((pts[0, :].shape[0],), dtype=torch.bool)
-        # toremoveW = torch.logical_or(pts[1, :] < bord, pts[1, :] >= (W - bord))
-        # toremoveH = torch.logical_or(pts[2, :] < bord, pts[2, :] >= (H - bord))
-        # toremove = torch.logical_or(torch.logical_or(toremoveB, toremoveW), toremoveH).to(self.device)
-        # pts = pts[:, ~toremove]
-
-        # print('pts final shape {}'.format(pts.shape))
-        # --- Process descriptor.
-        D = coarse_desc.shape[1]
-        if pts.shape[1] == 0:
-            desc = torch.zeros((batch_size, D, 0))
-        else:
-            # Interpolate into descriptor map using 2D point locations.
-            samp_pts = pts[1:3, :].clone()
-            samp_pts[0, :] = (samp_pts[0, :] / (float(W) / 2.)) - 1.
-            samp_pts[1, :] = (samp_pts[1, :] / (float(H) / 2.)) - 1.
-            samp_pts = samp_pts.transpose(0, 1).contiguous()
-            samp_pts = samp_pts.view(1, 1, -1, 2)
-            samp_pts = samp_pts.float().to(opt.device)
-            # print('grid_sample --> input:', coarse_desc.view(1, 256, 24, -1).shape)
-            # print('grid_sample --> grid:', samp_pts.shape)
-            desc = torch.nn.functional.grid_sample(
-                coarse_desc.view(1, 256, 24, -1).cpu(), samp_pts.cpu(), align_corners=True)
-            desc = desc.reshape(D, -1)
-            desc = desc / torch.norm(desc, dim=0)
+        # bs, xs, ys = torch.where(heatmap >= 0.01 * torch.ones([batch_size, heatmap.shape[1],
+        #                                                        heatmap.shape[2]]).to(opt.device))
+        # pts = torch.zeros((4, len(xs)))  # Populate point data sized 3xN.
+        # pts[0, :] = bs
+        # pts[1, :] = ys
+        # pts[2, :] = xs
+        # pts[3, :] = heatmap[bs, xs, ys]
+        # # pts, _ = self.nms_fast(pts, H, W, dist_thresh=self.nms_dist) # NMS yes or not? if yes, implement it
+        # inds = torch.argsort(pts[3, :], descending=True)
+        # pts = pts[:, inds]  # Sort by confidence.
+        #
+        # # Remove points along border.
+        # # toremoveB = torch.zeros((pts[0, :].shape[0],), dtype=torch.bool)
+        # # toremoveW = torch.logical_or(pts[1, :] < bord, pts[1, :] >= (W - bord))
+        # # toremoveH = torch.logical_or(pts[2, :] < bord, pts[2, :] >= (H - bord))
+        # # toremove = torch.logical_or(torch.logical_or(toremoveB, toremoveW), toremoveH).to(self.device)
+        # # pts = pts[:, ~toremove]
+        #
+        # # print('pts final shape {}'.format(pts.shape))
+        # # --- Process descriptor.
+        # D = coarse_desc.shape[1]
+        # if pts.shape[1] == 0:
+        #     desc = torch.zeros((batch_size, D, 0))
+        # else:
+        #     # Interpolate into descriptor map using 2D point locations.
+        #     samp_pts = pts[1:3, :].clone()
+        #     samp_pts[0, :] = (samp_pts[0, :] / (float(W) / 2.)) - 1.
+        #     samp_pts[1, :] = (samp_pts[1, :] / (float(H) / 2.)) - 1.
+        #     samp_pts = samp_pts.transpose(0, 1).contiguous()
+        #     samp_pts = samp_pts.view(1, 1, -1, 2)
+        #     samp_pts = samp_pts.float().to(opt.device)
+        #     # print('grid_sample --> input:', coarse_desc.view(1, 256, 24, -1).shape)
+        #     # print('grid_sample --> grid:', samp_pts.shape)
+        #     desc = torch.nn.functional.grid_sample(
+        #         coarse_desc.view(1, 256, 24, -1).cpu(), samp_pts.cpu(), align_corners=True)
+        #     desc = desc.reshape(D, -1)
+        #     desc = desc / torch.norm(desc, dim=0)
 
         #####################################
         # loss computation part #############
         #####################################
 
-        # Grab SP probs to mask input image and disparity too. L_s computed just for img_0 as MD2 standard pipeline
+        loss_SP_reg = compute_regularization_SP_loss(heatmap)
 
-        # heat_bool = torch.where(
-        #     heatmap.unsqueeze(1) > 0.01 * torch.ones([batch_size, 1, H, W]).to(opt.device))
-        # mask_sp = torch.zeros(heatmap.unsqueeze(1).shape, requires_grad=True).to(opt.device)
-        # mask_sp[heat_bool] = 1.0
-        # masked_img = mask_sp * torch.randn(8, 3, 192, 640).to(opt.device)
-        # masked_disp = mask_sp * torch.randn(8, 1, 192, 640).to(opt.device)
-        masked_img = heatmap.unsqueeze(1).repeat(1, 3, 1, 1) * torch.randn(8, 3, 192, 640).to(opt.device)
-        masked_disp = heatmap.unsqueeze(1) * torch.randn(8, 1, 192, 640).to(opt.device)
-        smooth_loss_SP = get_smooth_loss(masked_disp, masked_img)
-        # loss += (self.opt.SP_disparity_smoothness * smooth_loss_SP / (2 ** scale))  # old formula
-        loss_SP = loss_SP + (0.15 * smooth_loss_SP)
-
-        total_loss = total_loss + loss_SP
+        total_loss = total_loss + (1 * loss_SP_reg)
 
         # loss = torch.norm(heatmap)
         model_optimizer.zero_grad()
@@ -220,7 +226,12 @@ def main():
                 # print(name, 'loss:', loss)
                 print(param[0][:5].view(1, -1))
         print('Same weigths?', torch.equal(list(model.parameters())[-6], old_weights))
+        print('LOSS:', total_loss)
+        print('Sum of Heatmap: {}'.format(torch.sum(heatmap)))
 
 
 if __name__ == "__main__":
     main()
+    # e se il motivo fosse nell'architettura di SP stessa? quando ritorna H/8 ecc, nel canale c'è una probabilità, di
+    # conseguenza le altre potrebbero essere prossime allo 0 e quindi facendo operazioni di reshaping questa cosa
+    # non si annulla (?)

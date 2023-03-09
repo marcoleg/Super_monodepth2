@@ -256,6 +256,28 @@ class Trainer:
 
             self.step += 1
 
+    @staticmethod
+    def stack_SP_over_imgs(target_img, pts_wrt_batch):
+        fig = plt.figure()
+        fig.add_subplot(111)
+        plt.imshow(torch.permute(target_img, (1, 2, 0)).detach().cpu().numpy())
+        pts_coords = pts_wrt_batch[1:-1, :]
+        pts_coords_np = torch.t(pts_coords).detach().cpu().numpy()
+        plt.scatter(pts_coords_np[:, 0], pts_coords_np[:, 1], marker="o", color="red", s=20)
+        fig.tight_layout(pad=0)
+        plt.margins(0, 0)
+        fig.canvas.draw()
+        plt.show()
+        data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        print(data.shape)
+        final_img = torch.permute(torch.from_numpy(data), (2, 0, 1))
+        print(final_img.shape)
+        # print(final_img)
+        exit(0)
+        # TODO: credo che il problema sia sui margini perché non vengono tolti dal canvas
+        return final_img
+
     def pre_process_batch(self, inputs):
         """
         Input: MD2 input which contains 'color_aug' image BxHxWx3 that is initially transformed in grayscale (BxHxW)
@@ -282,21 +304,25 @@ class Trainer:
                 batch_size, H, W = img.shape[0], img.shape[2], img.shape[3]
                 # print('input size: {}'.format(img.shape))
 
-                print('+++++++++++++ pesi SP network:\n')
-                for name, param in self.models["superpoint"].named_parameters():
-                    if name == 'convPb.weight':
-                        print(param[0][:5].view(1, -1))
+                # print('+++++++++++++ pesi SP network:\n')
+                # for name, param in self.models["superpoint"].named_parameters():
+                #     if name == 'convPb.weight':
+                #         print(param[0][:5].view(1, -1))
 
                 sp_enc_out = self.models["superpoint"](img.to(self.device))
                 # print("sp_out --> coarse kps: {}\t coarse desc: {}".format(sp_enc_out[0].shape, sp_enc_out[1].shape))
                 semi, coarse_desc = sp_enc_out[0], sp_enc_out[1]
-                if torch.isnan(torch.sum(semi)):
-                    print('SEMI, tot float(nan) - step 1:', torch.nonzero(torch.isnan(semi.view(-1))).shape)
                 # dense = torch.exp(semi)
                 # dense = dense / (torch.sum(dense, dim=1).unsqueeze(1) + 0.00001)  # Should sum to 1
-                dense = self.softmax(semi)  # Use torch Softmax instead of previous 2 lines
-                # if torch.isnan(torch.sum(dense)):  # Check weather the dense tensor has NaN values
-                #     print('HEATMAP, tot float(nan) - step 3:', torch.nonzero(torch.isnan(dense.view(-1))).shape)
+                # dense = self.softmax(semi)  # Use torch Softmax instead of previous 2 lines
+                dense = semi.clone()
+                # Compute normalization (instead of Softmax) channel-wise
+                max_for_each_batch_size = torch.amax(dense, dim=(1, 2, 3))
+                min_for_each_batch_size = torch.amin(dense, dim=(1, 2, 3))
+                dense_num = (dense - min_for_each_batch_size.view(-1, 1, 1, 1))
+                dense_den = (max_for_each_batch_size - min_for_each_batch_size).view(-1, 1, 1, 1)
+                dense = dense_num / dense_den
+
                 nodust = dense[:, :-1, :, :]
                 Hc = int(H / 8)
                 Wc = int(W / 8)
@@ -306,11 +332,11 @@ class Trainer:
                 heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
                 # print('heatmap final shape {}'.format(heatmap.shape))
                 # print("heatmap - max {}\tmin {}".format(heatmap.max(), heatmap.min()))
-                # bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones([batch_size, heatmap.shape[1],
-                #                                                                        heatmap.shape[2]]).to(
-                #     self.device))  # OLD indexing considering threshold of SuperPoint
-                bs, xs, ys = torch.where(heatmap >=
-                                         torch.zeros([batch_size, heatmap.shape[1], heatmap.shape[2]]).to(self.device))
+                bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones([batch_size, heatmap.shape[1],
+                                                                                       heatmap.shape[2]]).to(
+                    self.device))  # OLD indexing considering threshold of SuperPoint
+                # bs, xs, ys = torch.where(heatmap >=
+                #                          torch.zeros([batch_size, heatmap.shape[1], heatmap.shape[2]]).to(self.device))
                 if len(xs) == 0:
                     dict_to_add[('color_aug_SP_out', idx, 0)] = (torch.zeros((4, 0), device=self.device),
                                                                  torch.zeros((256, 0), device=self.device),
@@ -327,11 +353,11 @@ class Trainer:
                 pts = pts[:, inds]  # Sort by confidence.
 
                 # Remove points along border.
-                # toremoveB = torch.zeros((pts[0, :].shape[0],), dtype=torch.bool)
-                # toremoveW = torch.logical_or(pts[1, :] < bord, pts[1, :] >= (W - bord))
-                # toremoveH = torch.logical_or(pts[2, :] < bord, pts[2, :] >= (H - bord))
-                # toremove = torch.logical_or(torch.logical_or(toremoveB, toremoveW), toremoveH).to(self.device)
-                # pts = pts[:, ~toremove]
+                toremoveB = torch.zeros((pts[0, :].shape[0],), dtype=torch.bool)
+                toremoveW = torch.logical_or(pts[1, :] < bord, pts[1, :] >= (W - bord))
+                toremoveH = torch.logical_or(pts[2, :] < bord, pts[2, :] >= (H - bord))
+                toremove = torch.logical_or(torch.logical_or(toremoveB, toremoveW), toremoveH).to(self.device)
+                pts = pts[:, ~toremove]
 
                 # print('pts final shape {}'.format(pts.shape))
                 # --- Process descriptor.
@@ -584,6 +610,12 @@ class Trainer:
         sum_reg = torch.sum(diff)
         return sum_reg
 
+    def favour_SP_sparsity_loss(self, heatmap):
+        tot_pixels = torch.tensor(heatmap.shape[0] * heatmap.shape[1] * heatmap.shape[2], device=self.device)
+        tot_wanted_pixels = tot_pixels / 60
+        diff = torch.abs(torch.sum(heatmap) - tot_wanted_pixels)
+        return diff
+
     def compute_losses(self, inputs, outputs):
         """Compute the reprojection and smoothness losses for a minibatch
         """
@@ -692,8 +724,9 @@ class Trainer:
             heatmap = inputs[('color_aug_SP_out', 0, scale)][2]  # heatmap of target image (indexed by 0)
 
             loss_SP_reg = self.compute_regularization_SP_loss(heatmap)
-            # loss_SP += self.opt.SP_regulariz_loss_decay * loss_SP_reg
+            loss_SP_sparsity = self.favour_SP_sparsity_loss(heatmap)  # about 2000 pixels per image (16k for batch=8)
             losses["loss_SP_reg/{}".format(scale)] = loss_SP_reg
+            losses["loss_SP_spars/{}".format(scale)] = loss_SP_sparsity
 
             for frame_id in self.opt.frame_ids[1:]:  # -1 and 1 --> prev and next image
                 pred = outputs[("color", frame_id, scale)]
@@ -755,9 +788,10 @@ class Trainer:
                         idxs_SP > identity_reprojection_loss_SP.shape[1] - 1).float()
 
             loss_SP += to_optimise_SP.mean()
-            # total_loss += loss_SP
-            total_loss += self.opt.SP_regulariz_loss_decay * loss_SP_reg
-            # TODO: prova reinizializzando i pesi di SP!
+            total_loss += (self.opt.SP_loss_gamma * loss_SP)
+            total_loss += (self.opt.SP_regulariz_loss_decay * loss_SP_reg)
+            total_loss += (self.opt.SP_loss_sparsity_weight * loss_SP_sparsity)
+            print('SUM HEATMAP VALS:', torch.sum(heatmap), '\n')
             losses["loss_SP/{}".format(scale)] = loss_SP
 
             '''
@@ -869,6 +903,8 @@ class Trainer:
     def log(self, mode, inputs, outputs, losses):
         """Write an event to the tensorboard events file
         """
+        pts = inputs[('color_aug_SP_out', 0, 0)][0]  # pts coords of heatmap values
+
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
@@ -899,6 +935,10 @@ class Trainer:
                     writer.add_image(
                         "automask_{}/{}".format(s, j),
                         outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
+
+            writer.add_image("SP_heatmap_on_target_0/{}".format(j),
+                             self.stack_SP_over_imgs(inputs[("color", 0, 0)][j],
+                                                     pts[:, pts[0] == j]))
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
