@@ -69,11 +69,15 @@ class MonodepthOptions:
         self.parser.add_argument("--SP_regulariz_loss_decay",
                                  type=float,
                                  help="SP regularization loss decay weight",
-                                 default=1e-3)
+                                 default=1e-4)
         self.parser.add_argument("--SP_loss_sparsity_weight",
                                  type=float,
                                  help="SP loss weight for sparsity",
-                                 default=1e-1)
+                                 default=5e-3)
+        self.parser.add_argument("--SP_vs_SP_decay",
+                                 type=float,
+                                 help="SP loss decay for regularization loss wrt SP with frozen weights",
+                                 default=10000)
         self.parser.add_argument("--SP_loss_gamma",
                                  type=float,
                                  help="SP loss gamma which multiplies reprojection loss",
@@ -167,13 +171,13 @@ class MonodepthOptions:
                                  nargs="+",
                                  type=str,
                                  help="models to load",
-                                 default=["superpoint", "encoder", "depth", "pose_encoder", "pose"])
+                                 default=["superpoint", "encoder", "depth", "pose_encoder", "pose", "superpoint_reg"])
 
         # LOGGING options
         self.parser.add_argument("--log_frequency",
                                  type=int,
                                  help="number of batches between each tensorboard log",
-                                 default=250)
+                                 default=50)  # 250)
         self.parser.add_argument("--save_frequency",
                                  type=int,
                                  help="number of epochs between each save",

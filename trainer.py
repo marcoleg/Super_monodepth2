@@ -27,10 +27,14 @@ import networks
 from IPython import embed
 
 from torchvision.transforms.functional import rgb_to_grayscale
+import matplotlib
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+matplotlib.use('Agg')
 
 
 class Trainer:
     def __init__(self, options):
+        self.semiNL = None
         self.start_time = None
         self.step = None
         self.epoch = None
@@ -65,6 +69,10 @@ class Trainer:
 
         # Superpoint: Train on GPU, deploy on GPU.
         self.parameters_to_train += list(self.models["superpoint"].parameters())  # automatic weights loading
+
+        # Superpoint regularization network: its weights are not loaded to parameters_to_train list
+        self.models["superpoint_reg"] = networks.SuperPointNet()
+        self.models["superpoint_reg"].to(self.device)
 
         self.models["encoder"] = networks.ResnetEncoder(self.opt.num_layers, self.opt.weights_init == "pretrained")
         self.models["encoder"].to(self.device)
@@ -223,10 +231,13 @@ class Trainer:
 
             if ('color_aug_SP_out', 0, 0) not in inputs:
                 img: torch.Tensor = rgb_to_grayscale(inputs[('color_aug', 0, 0)])
+                Hc = int(img.shape[2] / 8)
+                Wc = int(img.shape[3] / 8)
                 inputs[('color_aug_SP_out', 0, 0)] = (torch.zeros((4, 0), device=self.device),
                                                       torch.zeros((256, 0), device=self.device),
                                                       torch.zeros((img.shape[0], img.shape[2], img.shape[3]),
-                                                                  device=self.device))
+                                                                  device=self.device),
+                                                      torch.zeros((img.shape[0], 65, Hc, Wc), device=self.device))
             # elif inputs[('color_aug_SP_out', 0, 0)][-1] is None:
             #     # if heatmap is None -> there's no input color_aug img
             #     img: torch.Tensor = rgb_to_grayscale(inputs[('color_aug', 0, 0)])
@@ -258,25 +269,60 @@ class Trainer:
 
     @staticmethod
     def stack_SP_over_imgs(target_img, pts_wrt_batch):
-        fig = plt.figure()
-        fig.add_subplot(111)
-        plt.imshow(torch.permute(target_img, (1, 2, 0)).detach().cpu().numpy())
-        pts_coords = pts_wrt_batch[1:-1, :]
-        pts_coords_np = torch.t(pts_coords).detach().cpu().numpy()
-        plt.scatter(pts_coords_np[:, 0], pts_coords_np[:, 1], marker="o", color="red", s=20)
-        fig.tight_layout(pad=0)
-        plt.margins(0, 0)
-        fig.canvas.draw()
+        # imshow target image
+        fig, ax = plt.subplots()
+        ax.set_axis_off()
+        ax.imshow(target_img.permute(1, 2, 0).detach().cpu())  # permute to match the order of dims expected by imshow
+        ax.scatter(pts_wrt_batch[1, :].detach().cpu(), pts_wrt_batch[2, :].detach().cpu(), marker="o", s=5, c='red')
+
+        # Convert the output to a tensor
+        canvas = FigureCanvas(fig)
+        canvas.draw()
+        output_img = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
+        # Remove alpha channel and convert to PyTorch tensor
+        output_img = torch.from_numpy(output_img[:, :, :3].copy()).permute(2, 0, 1)
+        b, h, w = target_img.shape
+        canvas_w, canvas_h = canvas.get_width_height()
+        output_img = output_img[:, int((canvas_h - h)/2):int(canvas_h - ((canvas_h - h)/2)), :]
+        return output_img
+
+    def get_heatmap_for_log(self, batch_size, H, W, idx):
+        dense = self.softmax(self.semiNL)  # Use torch Softmax instead of previous 2 lines (sum = 1 in channel dim)
+        nodust = dense[:, :-1, :, :]
+        Hc = int(H / 8)
+        Wc = int(W / 8)
+        nodust = torch.permute(nodust, (0, 2, 3, 1))
+        heatmap = torch.reshape(nodust, [batch_size, Hc, Wc, 8, 8])
+        heatmap = torch.permute(heatmap, [0, 1, 3, 2, 4])
+        heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
+
+        print('Batch {} of SP with frozen weights; sum: {}'.format(idx, torch.sum(heatmap[idx])))
+
+        # TODO: do the comment part below to show SP frozen points on original image
+        #  e stampare i SP points sull'immagine originale per visualizzarli correttamente
+
+        '''
+        # imshow target image
+        fig, ax = plt.subplots()
+        ax.set_axis_off()
+        ax.imshow(heatmap[idx].detach().cpu())  # permute to match the order of dims expected by imshow
         plt.show()
-        data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-        print(data.shape)
-        final_img = torch.permute(torch.from_numpy(data), (2, 0, 1))
-        print(final_img.shape)
-        # print(final_img)
-        exit(0)
-        # TODO: credo che il problema sia sui margini perché non vengono tolti dal canvas
-        return final_img
+        pts_greater_than_th = torch.where(heatmap[idx] > 0.2, 1.0, 0.0)
+        # print("Sum of batch {}: {}".format(idx, torch.sum(pts_greater_than_th)))
+        ax.scatter(pts_wrt_batch[1, :].detach().cpu(), pts_wrt_batch[2, :].detach().cpu(), marker="o", s=5, c='red')
+
+        # Convert the output to a tensor
+        canvas = FigureCanvas(fig)
+        canvas.draw()
+        output_img = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
+        # Remove alpha channel and convert to PyTorch tensor
+        output_img = torch.from_numpy(output_img[:, :, :3].copy()).permute(2, 0, 1)
+        b, h, w = batch_size, H, W
+        canvas_w, canvas_h = canvas.get_width_height()
+        output_img = output_img[:, int((canvas_h - h) / 2):int(canvas_h - ((canvas_h - h) / 2)), :]
+        return output_img
+        '''
+        return heatmap[idx]
 
     def pre_process_batch(self, inputs):
         """
@@ -288,10 +334,11 @@ class Trainer:
         pts     --> 4xN     - 'survived' points (1st row: B; 2nd, 3rd row: H, W coords; 4th row: heatmap value)
         desc    --> 256xN   - associated descripors (same order as pts)
         heatmap --> BxHxW   - probability mask
+        dense   --> Bx65xHcxWc - Hc = H/8; this is the tensor returned by last SP conv layer
 
         N.B. there might be a problem with descriptors because the original method was not designed to work with B > 1
         TODO: non-maximum suppression still not implemented! Maybe we have to not implement it and also don't select
-        TODO: pixels with logical_OR or similar because we keep all the heatmap values so we must keep all descriptors!
+            pixels with logical_OR or similar because we keep all the heatmap values so we must keep all descriptors!
         """
         bord = 4
         dict_to_add = {}
@@ -314,14 +361,16 @@ class Trainer:
                 semi, coarse_desc = sp_enc_out[0], sp_enc_out[1]
                 # dense = torch.exp(semi)
                 # dense = dense / (torch.sum(dense, dim=1).unsqueeze(1) + 0.00001)  # Should sum to 1
-                # dense = self.softmax(semi)  # Use torch Softmax instead of previous 2 lines
-                dense = semi.clone()
+                dense = self.softmax(semi)  # Use torch Softmax instead of previous 2 lines (sum = 1 in channel dim)
+
+                '''
                 # Compute normalization (instead of Softmax) channel-wise
                 max_for_each_batch_size = torch.amax(dense, dim=(1, 2, 3))
                 min_for_each_batch_size = torch.amin(dense, dim=(1, 2, 3))
                 dense_num = (dense - min_for_each_batch_size.view(-1, 1, 1, 1))
                 dense_den = (max_for_each_batch_size - min_for_each_batch_size).view(-1, 1, 1, 1)
                 dense = dense_num / dense_den
+                '''
 
                 nodust = dense[:, :-1, :, :]
                 Hc = int(H / 8)
@@ -332,16 +381,17 @@ class Trainer:
                 heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
                 # print('heatmap final shape {}'.format(heatmap.shape))
                 # print("heatmap - max {}\tmin {}".format(heatmap.max(), heatmap.min()))
-                bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones([batch_size, heatmap.shape[1],
-                                                                                       heatmap.shape[2]]).to(
-                    self.device))  # OLD indexing considering threshold of SuperPoint
-                # bs, xs, ys = torch.where(heatmap >=
-                #                          torch.zeros([batch_size, heatmap.shape[1], heatmap.shape[2]]).to(self.device))
+
+                # OLD indexing considering threshold of SuperPoint
+                bs, xs, ys = torch.where(heatmap >= self.opt.conf_thresh * torch.ones_like(heatmap))
+                # bs, xs, ys = torch.where(heatmap >= torch.zeros_like(heatmap))
+
                 if len(xs) == 0:
                     dict_to_add[('color_aug_SP_out', idx, 0)] = (torch.zeros((4, 0), device=self.device),
                                                                  torch.zeros((256, 0), device=self.device),
                                                                  torch.zeros((img.shape[0], img.shape[2], img.shape[3]),
-                                                                             device=self.device))
+                                                                             device=self.device),
+                                                                 dense)
                     return {**inputs, **dict_to_add}
                 pts = torch.zeros((4, len(xs)))  # Populate point data sized 3(or 4 if batch is considered)xN.
                 pts[0, :] = bs
@@ -379,7 +429,7 @@ class Trainer:
                     desc = desc.reshape(D, -1)
                     desc = desc / torch.norm(desc, dim=0)
                     # print('desc final shape:', desc.shape)
-                dict_to_add[('color_aug_SP_out', idx, 0)] = (pts, desc, heatmap)
+                dict_to_add[('color_aug_SP_out', idx, 0)] = (pts, desc, heatmap, dense)
         return {**inputs, **dict_to_add}
 
     def process_batch(self, inputs):
@@ -493,12 +543,13 @@ class Trainer:
 
             if ('color_aug_SP_out', 0, 0) not in inputs:
                 img: torch.Tensor = rgb_to_grayscale(inputs[('color_aug', 0, 0)])
-                inputs[('color_aug_SP_out', 0, 0)] = (torch.zeros((4, 0)),
-                                                      torch.zeros((256, 0)),
-                                                      torch.zeros((img.shape[0], img.shape[2], img.shape[3])))
-            elif inputs[('color_aug_SP_out', 0, 0)][-1] is None:  # if heatmap is None -> there's no input color_aug img
-                img: torch.Tensor = rgb_to_grayscale(inputs['color_aug'])
-                inputs[('color_aug_SP_out', 0, 0)][-1] = torch.zeros((img.shape[0], img.shape[2], img.shape[3]))
+                Hc = int(img.shape[2] / 8)
+                Wc = int(img.shape[3] / 8)
+                inputs[('color_aug_SP_out', 0, 0)] = (torch.zeros((4, 0), device=self.device),
+                                                      torch.zeros((256, 0), device=self.device),
+                                                      torch.zeros((img.shape[0], img.shape[2], img.shape[3]),
+                                                                  device=self.device),
+                                                      torch.zeros((img.shape[0], 65, Hc, Wc), device=self.device))
 
             outputs, losses = self.process_batch(inputs)
 
@@ -556,18 +607,6 @@ class Trainer:
                     outputs[("sample", frame_id, scale)],
                     padding_mode="border")  # this is the reprojected sampled image color
 
-                # plt.figure(0)
-                # plt.title(("reprojected", frame_id, scale))
-                # plt.imshow(outputs[("color", frame_id, scale)][0].permute(1, 2, 0).detach().cpu())
-                # plt.figure(1)
-                # plt.title(("target (0)", 0, scale))
-                # plt.imshow(inputs[("color_aug", 0, 0)][0].permute(1, 2, 0).detach().cpu())
-                # plt.figure(2)
-                # plt.title(("source (-1)", 0, scale))
-                # plt.imshow(inputs[("color_aug", -1, 0)][0].permute(1, 2, 0).detach().cpu())
-                # plt.show()
-                # exit(0)
-
                 if not self.opt.disable_automasking:  # opt.disable_automasking is False by default -> not (...) is True
                     outputs[("color_identity", frame_id, scale)] = \
                         inputs[("color", frame_id, source_scale)]
@@ -607,14 +646,31 @@ class Trainer:
     @staticmethod
     def compute_regularization_SP_loss(heatmap):
         diff = torch.ones_like(heatmap, requires_grad=True) - heatmap
-        sum_reg = torch.sum(diff)
+        sum_reg = torch.mean(diff)
         return sum_reg
 
     def favour_SP_sparsity_loss(self, heatmap):
-        tot_pixels = torch.tensor(heatmap.shape[0] * heatmap.shape[1] * heatmap.shape[2], device=self.device)
-        tot_wanted_pixels = tot_pixels / 60
-        diff = torch.abs(torch.sum(heatmap) - tot_wanted_pixels)
-        return diff
+        tot_pixels = torch.tensor(heatmap.shape[1] * heatmap.shape[2], device=self.device)
+        tot_wanted_pixels = tot_pixels / 240  # 60
+        diff = torch.abs(torch.sum(heatmap, dim=(1, 2)) - tot_wanted_pixels)
+        return torch.mean(diff)
+
+    def compute_SP_vs_SP_reg(self, img: torch.Tensor, dense: torch.Tensor):
+        sp_enc_outNL = self.models['superpoint_reg'](rgb_to_grayscale(img))  # NL stands for Non-Learned
+
+        '''
+        # N.B. weights in this SP net are employes just to regularize, so they don't change in training phase
+        print('+++++++++++++ pesi SP network:\n')
+        for name, param in self.models["superpoint_reg"].named_parameters():
+            if name == 'convPb.weight':
+                print(param[0][:5].view(1, -1))
+        '''
+        # TODO: controllare se la crossEntropy funziona bene, provare con un 1 e tutti gli altri 0 nel target!
+
+        semiNL, coarse_descNL = sp_enc_outNL[0], sp_enc_outNL[1]
+        self.semiNL = semiNL
+        loss = nn.CrossEntropyLoss()
+        return loss(semiNL, dense)
 
     def compute_losses(self, inputs, outputs):
         """Compute the reprojection and smoothness losses for a minibatch
@@ -639,18 +695,6 @@ class Trainer:
 
             for frame_id in self.opt.frame_ids[1:]:  # -1 and 1 --> prev and next image
                 pred = outputs[("color", frame_id, scale)]
-
-                # plt.figure(0)
-                # plt.title(("reprojected", frame_id, scale))
-                # plt.imshow(outputs[("color", frame_id, scale)][0].permute(1, 2, 0).detach().cpu())
-                # plt.figure(1)
-                # plt.title(("target (0)", 0, scale))
-                # plt.imshow(inputs[("color_aug", 0, 0)][0].permute(1, 2, 0).detach().cpu())
-                # plt.figure(2)
-                # plt.title(("source (-1)", 0, scale))
-                # plt.imshow(inputs[("color_aug", -1, 0)][0].permute(1, 2, 0).detach().cpu())
-                # plt.show()
-                # exit(0)
 
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
 
@@ -723,10 +767,14 @@ class Trainer:
             # TODO: different scales for heatmap (?)
             heatmap = inputs[('color_aug_SP_out', 0, scale)][2]  # heatmap of target image (indexed by 0)
 
-            loss_SP_reg = self.compute_regularization_SP_loss(heatmap)
-            loss_SP_sparsity = self.favour_SP_sparsity_loss(heatmap)  # about 2000 pixels per image (16k for batch=8)
-            losses["loss_SP_reg/{}".format(scale)] = loss_SP_reg
-            losses["loss_SP_spars/{}".format(scale)] = loss_SP_sparsity
+            # loss_SP_reg = self.compute_regularization_SP_loss(heatmap)
+            # loss_SP_sparsity = self.favour_SP_sparsity_loss(heatmap)  # about 2000 pixels per image (16k for batch=8)
+            # losses["loss_SP_reg/{}".format(scale)] = loss_SP_reg
+            # losses["loss_SP_spars/{}".format(scale)] = loss_SP_sparsity
+
+            loss_SP_vs_SP_reg = self.compute_SP_vs_SP_reg(img=inputs[('color_aug', 0, 0)],
+                                                          dense=inputs[('color_aug_SP_out', 0, scale)][3])
+            losses["loss_SP_vs_SP/{}".format(scale)] = loss_SP_vs_SP_reg
 
             for frame_id in self.opt.frame_ids[1:]:  # -1 and 1 --> prev and next image
                 pred = outputs[("color", frame_id, scale)]
@@ -788,69 +836,23 @@ class Trainer:
                         idxs_SP > identity_reprojection_loss_SP.shape[1] - 1).float()
 
             loss_SP += to_optimise_SP.mean()
+
+            # Loss - reprojection times heatmap
             total_loss += (self.opt.SP_loss_gamma * loss_SP)
-            total_loss += (self.opt.SP_regulariz_loss_decay * loss_SP_reg)
-            total_loss += (self.opt.SP_loss_sparsity_weight * loss_SP_sparsity)
-            print('SUM HEATMAP VALS:', torch.sum(heatmap), '\n')
+            # Loss - regularization to constraint heatmap to be matrix of ones
+            # total_loss += (self.opt.SP_regulariz_loss_decay * loss_SP_reg)
+            # Loss - it encourages sparsity, i.e., 2000 SP points for each image
+            # total_loss += (self.opt.SP_loss_sparsity_weight * loss_SP_sparsity)
+            # Loss - regularization term, SP vs SP with frozen weights
+            total_loss += (self.opt.SP_vs_SP_decay * loss_SP_vs_SP_reg)
+
+            sum_heatmap_vals_per_batch = torch.sum(heatmap, dim=(1, 2)).data
+            heat_string = ''
+            for i in range(len(sum_heatmap_vals_per_batch)):
+                heat_string += '{}: {}\t'.format(i + 1, torch.round(sum_heatmap_vals_per_batch[i].data), 3)
+            print('\nSUM heatmap val per batch -> {}'.format(heat_string))
+
             losses["loss_SP/{}".format(scale)] = loss_SP
-
-            '''
-            # DELETE THIS PART WITH PARSIMONIA!!!!
-
-            # Grab SP probs to mask input image and disparity too. L_s computed just for img_0 as MD2 standard pipeline
-            heatmap = inputs[('color_aug_SP_out', 0, scale)][-1]
-            # heatmap.retain_grad()  # remove
-            # l = torch.norm(heatmap)
-            # l.backward()
-            # print('706 - ORA DOVREBBE AVERE IL GRADIENTE:', heatmap.grad.shape)
-            # exit(0)
-
-            # temp = torch.ones(heatmap.shape).to(self.device)  # remove
-            # loss_SP = torch.norm(temp-heatmap)  # remove
-
-            # print('loss_SP:', loss_SP)
-            # print('loss_SP shape:', loss_SP.shape)
-            # print('1:', heatmap.grad)
-            # self.model_optimizer.zero_grad()
-            # print(losses)
-            # loss_SP.backward()
-            # # plot_grad_flow(self.models['superpoint'].named_parameters())
-            # self.model_optimizer.step()
-            # print('2:', heatmap.grad)
-            # exit(0)
-            B, H, W = heatmap.shape
-            # heat_bool = torch.where(heatmap.unsqueeze(1) > self.opt.conf_thresh * torch.ones([B, 1, H, W]).to(self.device))
-            # heat_bool.retain_grad()  # remove
-            # print('heat bool shape:', heat_bool.shape)
-            # mask_sp = torch.zeros(heatmap.unsqueeze(1).shape, requires_grad=True).to(self.device)
-            # mask_sp[heat_bool] = 1.0
-            # mask_sp.retain_grad()  # remove
-            # masked_img = mask_sp * color
-            # masked_disp = mask_sp * disp
-
-            # masked_img = heatmap.unsqueeze(1).repeat(1, 3, 1, 1) * color
-            # masked_disp = heatmap.unsqueeze(1) * disp
-
-            masked_img = heatmap.unsqueeze(1).repeat(1, 3, 1, 1) * color
-            masked_disp = heatmap.unsqueeze(1) * disp
-
-            # masked_img.reatain_grad()  # remove (SURE??????)
-            # masked_disp.retain_grad()  # remove
-            # print(masked_img)
-            # exit(0)
-            # masked_disp.retain_grad()
-            smooth_loss_SP = get_smooth_loss(masked_disp, masked_img)
-            # smooth_loss_SP.retain_grad()  # remove
-            # loss += (self.opt.SP_disparity_smoothness * smooth_loss_SP / (2 ** scale))  # old formula
-            loss_SP = loss_SP + (self.opt.SP_disparity_smoothness * smooth_loss_SP)
-
-            # loss_SP.retain_grad()
-            # print('requires_grad SP:', loss_SP.requires_grad, '\tgrad:', loss_SP.grad)
-            # print('leaf SP:', loss_SP.is_leaf)
-            total_loss = total_loss + loss_SP
-            # print("autograd grad SP:", torch.autograd.grad(total_loss, masked_img, retain_graph=True)[0][0][0][0][0])
-            losses["loss_SP/{}".format(scale)] = loss_SP
-            '''
 
         # total_loss is not properly correct because it's scaled by 4 (num_scales) while SP_loss is computed just with
         # one single scale level. This global scale could be interpretated as an additional scaling of the SP_loss
@@ -904,6 +906,7 @@ class Trainer:
         """Write an event to the tensorboard events file
         """
         pts = inputs[('color_aug_SP_out', 0, 0)][0]  # pts coords of heatmap values
+        batch_size, _, H, W = inputs[("color", 0, 0)].shape
 
         writer = self.writers[mode]
         for l, v in losses.items():
@@ -937,8 +940,10 @@ class Trainer:
                         outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
 
             writer.add_image("SP_heatmap_on_target_0/{}".format(j),
-                             self.stack_SP_over_imgs(inputs[("color", 0, 0)][j],
-                                                     pts[:, pts[0] == j]))
+                             self.stack_SP_over_imgs(inputs[("color", 0, 0)][j].clone(), pts[:, pts[0] == j].clone()),
+                             self.step)
+            writer.add_image("SP Heatmap with freezed weights_0/{}".format(j),
+                             self.get_heatmap_for_log(batch_size, H, W, idx=j).view(-1, H, W), self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
