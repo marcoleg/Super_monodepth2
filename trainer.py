@@ -286,30 +286,22 @@ class Trainer:
         output_img = output_img[:, int((canvas_h - h)/2):int(canvas_h - ((canvas_h - h)/2)), :]
         return output_img
 
-    def get_heatmap_for_log(self, batch_size, H, W, idx):
-        dense = self.softmax(self.semiNL)  # Use torch Softmax instead of previous 2 lines (sum = 1 in channel dim)
-        nodust = dense[:, :-1, :, :]
-        Hc = int(H / 8)
-        Wc = int(W / 8)
-        nodust = torch.permute(nodust, (0, 2, 3, 1))
-        heatmap = torch.reshape(nodust, [batch_size, Hc, Wc, 8, 8])
-        heatmap = torch.permute(heatmap, [0, 1, 3, 2, 4])
-        heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
+    def get_heatmap_for_log(self, heatmap, target_img, batch_size, H, W, idx):
+        print('Batch {} of SP with frozen weights; sum: {}'.format(idx, torch.sum(heatmap)))
 
-        print('Batch {} of SP with frozen weights; sum: {}'.format(idx, torch.sum(heatmap[idx])))
+        # TODO: controllare crossentropy perché se è scritta male è normale che fa il comportamento a griglia perché è
+        #  dato da avere una somma a 1 (per via della softmax) ogni cella 8x8 quindi basta che sia un valore alto tra
+        #  quelli che non faceva parte del dustbin e viene messo all'interno della cella come punto rosso. Torna così il
+        #  discorso che faceva 1920 perché ci sono 80x8=640 pixel sulla W e quindi ogni 64 pixel (diciamo per semplicità
+        #  perché in realtà sono disposti a quadrato) c'è un pixel a 1 (quindi rosso).
 
-        # TODO: do the comment part below to show SP frozen points on original image
-        #  e stampare i SP points sull'immagine originale per visualizzarli correttamente
-
-        '''
         # imshow target image
         fig, ax = plt.subplots()
         ax.set_axis_off()
-        ax.imshow(heatmap[idx].detach().cpu())  # permute to match the order of dims expected by imshow
-        plt.show()
-        pts_greater_than_th = torch.where(heatmap[idx] > 0.2, 1.0, 0.0)
-        # print("Sum of batch {}: {}".format(idx, torch.sum(pts_greater_than_th)))
-        ax.scatter(pts_wrt_batch[1, :].detach().cpu(), pts_wrt_batch[2, :].detach().cpu(), marker="o", s=5, c='red')
+        ax.imshow(target_img.permute(1, 2, 0).detach().cpu())  # permute to match the order of dims expected by imshow
+        pts_greater_than_th = torch.where(heatmap >= torch.tensor(self.opt.conf_thresh), 1.0, 0.0).nonzero()
+        ax.scatter(pts_greater_than_th[:, 1].detach().cpu(), pts_greater_than_th[:, 0].detach().cpu(),
+                   marker="o", s=5, c='darkviolet')
 
         # Convert the output to a tensor
         canvas = FigureCanvas(fig)
@@ -321,8 +313,6 @@ class Trainer:
         canvas_w, canvas_h = canvas.get_width_height()
         output_img = output_img[:, int((canvas_h - h) / 2):int(canvas_h - ((canvas_h - h) / 2)), :]
         return output_img
-        '''
-        return heatmap[idx]
 
     def pre_process_batch(self, inputs):
         """
@@ -373,6 +363,7 @@ class Trainer:
                 '''
 
                 nodust = dense[:, :-1, :, :]
+                print('dustbin sum batch 0: {}'.format(torch.sum(dense[0, -1, :, :])))  # 24x80
                 Hc = int(H / 8)
                 Wc = int(W / 8)
                 nodust = torch.permute(nodust, (0, 2, 3, 1))
@@ -657,6 +648,12 @@ class Trainer:
 
     def compute_SP_vs_SP_reg(self, img: torch.Tensor, dense: torch.Tensor):
         sp_enc_outNL = self.models['superpoint_reg'](rgb_to_grayscale(img))  # NL stands for Non-Learned
+        print('dense max idx: {}'.format(torch.sum(64 == torch.argmax(dense, dim=1)[0])))  # questo fa 1920 infatti viene
+        # predetto sempre il 64esimo ossia il dustbin perché è sbilanciato dato che ci sono pochissime feaures dentro
+        # SP. Tale risultato è corretto perché 1920 = H/8 * W/8 (24*80) e ciò significa che per ogni cella 8x8 ci
+        # sta il massimo che è nel dustbin. Infatti a riga 366 stampa tutti 1 nel dustbin e la somma fa 1920 su una
+        # batch e ciò significa che, quando lo rimuovo e riproietto, mi troverò nella cella 8x8 tutti ZERI, infatti poi
+        # la somma, per ogni batch, viene 0
 
         '''
         # N.B. weights in this SP net are employes just to regularize, so they don't change in training phase
@@ -668,9 +665,10 @@ class Trainer:
         # TODO: controllare se la crossEntropy funziona bene, provare con un 1 e tutti gli altri 0 nel target!
 
         semiNL, coarse_descNL = sp_enc_outNL[0], sp_enc_outNL[1]
-        self.semiNL = semiNL
+        self.semiNL = semiNL.clone()
+
         loss = nn.CrossEntropyLoss()
-        return loss(semiNL, dense)
+        return loss(dense, self.softmax(semiNL))
 
     def compute_losses(self, inputs, outputs):
         """Compute the reprojection and smoothness losses for a minibatch
@@ -693,6 +691,7 @@ class Trainer:
             color = inputs[("color", 0, scale)]
             target = inputs[("color", 0, source_scale)]
 
+            '''
             for frame_id in self.opt.frame_ids[1:]:  # -1 and 1 --> prev and next image
                 pred = outputs[("color", frame_id, scale)]
 
@@ -759,6 +758,7 @@ class Trainer:
             loss = loss + self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
             total_loss += loss
             losses["loss/{}".format(scale)] = loss
+            '''
 
             ########################################################################################
             ############## LOSS SUPERPOINT SECTION - REPROJECTION AND REGULARIZAZION ###############
@@ -768,9 +768,9 @@ class Trainer:
             heatmap = inputs[('color_aug_SP_out', 0, scale)][2]  # heatmap of target image (indexed by 0)
 
             # loss_SP_reg = self.compute_regularization_SP_loss(heatmap)
-            # loss_SP_sparsity = self.favour_SP_sparsity_loss(heatmap)  # about 2000 pixels per image (16k for batch=8)
             # losses["loss_SP_reg/{}".format(scale)] = loss_SP_reg
-            # losses["loss_SP_spars/{}".format(scale)] = loss_SP_sparsity
+            loss_SP_sparsity = self.favour_SP_sparsity_loss(heatmap)  # about 2000 pixels per image (16k for batch=8)
+            losses["loss_SP_spars/{}".format(scale)] = loss_SP_sparsity
 
             loss_SP_vs_SP_reg = self.compute_SP_vs_SP_reg(img=inputs[('color_aug', 0, 0)],
                                                           dense=inputs[('color_aug_SP_out', 0, scale)][3])
@@ -839,10 +839,13 @@ class Trainer:
 
             # Loss - reprojection times heatmap
             total_loss += (self.opt.SP_loss_gamma * loss_SP)
+
             # Loss - regularization to constraint heatmap to be matrix of ones
             # total_loss += (self.opt.SP_regulariz_loss_decay * loss_SP_reg)
+
             # Loss - it encourages sparsity, i.e., 2000 SP points for each image
-            # total_loss += (self.opt.SP_loss_sparsity_weight * loss_SP_sparsity)
+            total_loss += (self.opt.SP_loss_sparsity_weight * loss_SP_sparsity)
+
             # Loss - regularization term, SP vs SP with frozen weights
             total_loss += (self.opt.SP_vs_SP_decay * loss_SP_vs_SP_reg)
 
@@ -908,6 +911,15 @@ class Trainer:
         pts = inputs[('color_aug_SP_out', 0, 0)][0]  # pts coords of heatmap values
         batch_size, _, H, W = inputs[("color", 0, 0)].shape
 
+        dense = self.softmax(self.semiNL)  # Use torch Softmax instead of previous 2 lines (sum = 1 in channel dim)
+        nodust = dense[:, :-1, :, :]
+        Hc = int(H / 8)
+        Wc = int(W / 8)
+        nodust = torch.permute(nodust, (0, 2, 3, 1))
+        heatmap = torch.reshape(nodust, [batch_size, Hc, Wc, 8, 8])
+        heatmap = torch.permute(heatmap, [0, 1, 3, 2, 4])
+        heatmap = torch.reshape(heatmap, [batch_size, Hc * 8, Wc * 8])
+
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
@@ -943,7 +955,8 @@ class Trainer:
                              self.stack_SP_over_imgs(inputs[("color", 0, 0)][j].clone(), pts[:, pts[0] == j].clone()),
                              self.step)
             writer.add_image("SP Heatmap with freezed weights_0/{}".format(j),
-                             self.get_heatmap_for_log(batch_size, H, W, idx=j).view(-1, H, W), self.step)
+                             self.get_heatmap_for_log(heatmap[j], inputs[("color", 0, 0)][j].clone(),
+                                                      batch_size, H, W, idx=j), self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
@@ -994,6 +1007,30 @@ class Trainer:
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
             self.models[n].load_state_dict(model_dict)
+            self.models[n].eval()
+            # ex_inp = torch.rand(8, 1, 192, 640).to(self.device)
+            # traced_script = torch.jit.trace(self.models[n], ex_inp)
+            print('path:', path)
+            # traced_script.save(path.split('.pt')[0] + '.pt')
+
+            # Save to file
+            # torch.jit.save(m, path.split('.pt')[0] + '.pt')
+            #torch.jit.save(self.models[n].state_dict(), path.split('.pt')[0] + '.pt', _use_new_zipfile_serialization=False)
+            from networks.testNet import testNet
+            # testNet = networks.testNet()
+            try:
+                testNet.load_state_dict(model_dict)
+            except RuntimeError:
+                print('ciao')
+            m = torch.jit.script(testNet)
+            for name, param in testNet.named_parameters():
+                if name == 'conv1a.weight':
+                    print(param[0])
+                    print(param[-1])
+            torch.save(testNet.state_dict(), path.split('superpoint')[0] + 'testNet.pt', _use_new_zipfile_serialization=False)
+            torch.save(testNet.state_dict(), path.split('superpoint')[0] + 'testNet_serTrue.pt')
+            torch.jit.save(m, path.split('superpoint')[0] + 'testNet_jit.pt')
+            exit(0)
 
         # loading adam state
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")

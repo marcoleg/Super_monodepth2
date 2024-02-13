@@ -77,7 +77,7 @@ class MonodepthOptions:
         self.parser.add_argument("--SP_vs_SP_decay",
                                  type=float,
                                  help="SP loss decay for regularization loss wrt SP with frozen weights",
-                                 default=10000)
+                                 default=1e1)
         self.parser.add_argument("--SP_loss_gamma",
                                  type=float,
                                  help="SP loss gamma which multiplies reprojection loss",
@@ -187,7 +187,7 @@ class MonodepthOptions:
         self.parser.add_argument("--conf_thresh",
                                  help="confidence threshold of superpoint",
                                  type=float,
-                                 default=0.75)
+                                 default=0.2)
         self.parser.add_argument("--eval_stereo",
                                  help="if set evaluates in stereo mode",
                                  action="store_true")
